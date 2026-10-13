@@ -101,6 +101,12 @@
         </aside>
 
         <section class="editor-pane" aria-label="OpenSCAD editor">
+          <div class="file-tabs" id="fileTabs" role="tablist" aria-label="Workspace files"></div>
+          <div class="file-menu" id="fileMenu" role="menu" hidden>
+            <button role="menuitem" data-file-action="rename">Rename</button>
+            <button role="menuitem" data-file-action="main">Make main</button>
+            <button role="menuitem" data-file-action="delete">Delete</button>
+          </div>
           <div class="editor-wrap">
             <div class="editor-overlay">
               <i id="dirtyIndicator" title="Unsaved changes"></i>

@@ -427,6 +427,38 @@ struct PlannedEdit {
 
 /// Whether `name` may name a workspace file: a plain `.scad` file name, with
 /// no directory and nothing a path could be built from.
+/// Whether an edit made against `expected` can still be applied to `current`.
+///
+/// The revision is workspace-wide, so without this an agent editing
+/// `parts.scad` would make the browser's in-flight save of `main.scad` fail.
+/// An edit is safe to apply over a newer revision when every change since its
+/// base is still in the log and was an edit or create of a *different* file:
+/// the text it was computed against is then exactly the text it lands on, and
+/// the result is validated against the current project as usual. Structural
+/// changes (delete, rename, setMain) and anything older than the log always
+/// conflict.
+fn rebase_allowed(current: &Workspace, expected: u64, update: &WorkspaceUpdate) -> bool {
+    if update.op != FileOp::Edit || expected >= current.revision {
+        return false;
+    }
+    let target = update.path.as_deref().unwrap_or(&current.main);
+    let since = current
+        .events
+        .iter()
+        .filter(|event| event.revision > expected)
+        .collect::<Vec<_>>();
+    since.len() as u64 == current.revision - expected
+        && since.iter().all(|event| {
+            // Events from before files existed carry no path: main-file edits.
+            let path = if event.path.is_empty() {
+                current.main.as_str()
+            } else {
+                event.path.as_str()
+            };
+            matches!(event.kind, EventKind::Edit | EventKind::Create) && path != target
+        })
+}
+
 impl PlannedEdit {
     fn event(&self, workspace_id: &str, revision: u64, source: &str, now: u64) -> WorkspaceEvent {
         WorkspaceEvent {
@@ -1040,7 +1072,7 @@ impl WorkspaceStore {
                     .map_err(UpdateError::Internal)
             })?
             .ok_or(UpdateError::NotFound)?;
-        if expected != current.revision {
+        if expected != current.revision && !rebase_allowed(&current, expected, &update) {
             return Err(UpdateError::Conflict(Box::new(current)));
         }
         let planned = plan_edit(&current, &mut update)?;
@@ -1052,7 +1084,10 @@ impl WorkspaceStore {
             .load(&mut inner, id)
             .map_err(UpdateError::Internal)?
             .ok_or(UpdateError::NotFound)?;
-        if latest.revision != expected {
+        // Compared with what was planned against, not with `expected`: a
+        // rebased edit was validated against `current`, and anything newer
+        // has not been looked at.
+        if latest.revision != current.revision {
             return Err(UpdateError::Conflict(Box::new(latest)));
         }
         let now = unix_millis();
@@ -5499,9 +5534,9 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(input) => input,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let source = match input.get("code").and_then(Value::as_str) {
-        Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => return respond_error(stream, 400, "The editor is empty."),
+    let project = match render_overlay_project(state, &input) {
+        Ok(project) => project,
+        Err((status, error)) => return respond_error(stream, status, &error),
     };
     let mode = input
         .get("mode")
@@ -5536,7 +5571,7 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
     };
     // Started here, not at arrival: the watchdog measures compute, never wait.
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    let compiled = match compile_native(&source, quality, Some(&cancellation)) {
+    let compiled = match compile_native(project, quality, Some(&cancellation)) {
         Ok(compiled) => compiled,
         Err(error) if deadline.expired() => {
             return respond_error(stream, 422, &deadline.explain(error))
@@ -5561,8 +5596,53 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
     )
 }
 
+/// What the stateless `/api/render` and `/api/export` compile.
+///
+/// Plain `code` is a one-file project. With a `workspaceId` it is that
+/// workspace's stored files with `code` laid over `path` (the main file when
+/// absent), so text that is unsaved — or that failed validation and could not
+/// be saved — still compiles with every file it includes. The main file is
+/// what renders either way.
+fn render_overlay_project(
+    state: &AppState,
+    input: &Value,
+) -> Result<engine::Project, (u16, String)> {
+    let code = input.get("code").and_then(Value::as_str).unwrap_or_default();
+    let single = || {
+        if code.trim().is_empty() {
+            return Err((400, "The editor is empty.".to_string()));
+        }
+        Ok(engine::Project::single(code))
+    };
+    let Some(id) = input
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return single();
+    };
+    // A workspace the browser made while the server was unreachable has an id
+    // the server never saw; it renders as the one file it is, as it always did.
+    let Some(workspace) = state.workspaces.get(id).map_err(|error| (500, error))? else {
+        return single();
+    };
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(&workspace.main);
+    if !workspace.files.contains_key(path) && !valid_file_name(path) {
+        return Err((400, format!("{path:?} is not a valid file name.")));
+    }
+    let mut project = workspace.project();
+    project.files.insert(path.to_string(), code.to_string());
+    if total_source_bytes(&project.files) > MAX_BODY {
+        return Err((400, "Workspace code exceeds the 2 MiB limit.".into()));
+    }
+    Ok(project)
+}
+
 fn compile_native(
-    source: &str,
+    source: impl Into<engine::Project>,
     quality: engine::Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompiledMesh, String> {
@@ -5650,9 +5730,9 @@ fn handle_export(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(input) => input,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let source = match input.get("code").and_then(Value::as_str) {
-        Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => return respond_error(stream, 400, "The editor is empty."),
+    let project = match render_overlay_project(state, &input) {
+        Ok(project) => project,
+        Err((status, error)) => return respond_error(stream, status, &error),
     };
     let format = input
         .get("format")
@@ -5666,7 +5746,7 @@ fn handle_export(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(object_ids) => object_ids,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let mesh = match export_mesh(&source, object_ids.as_deref()) {
+    let mesh = match export_mesh(project, object_ids.as_deref()) {
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -6949,6 +7029,180 @@ mod tests {
             json!({"op": "setMain", "path": "main.scad", "code": "cube(1);"}),
         );
         assert!(matches!(with_code, Err(UpdateError::Invalid(_))), "{with_code:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_edit_rebases_over_edits_to_other_files() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        // An agent edits params.scad while the browser still holds `base`.
+        let agent = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"path": "params.scad", "code": "size = 4;", "source": "ai"}),
+        )
+        .unwrap();
+        assert_eq!(agent.workspace.revision, base + 1);
+        let browser = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"code": "include <params.scad>\ncube(size * 2);"}),
+        )
+        .expect("main.scad was untouched since base");
+        assert_eq!(browser.workspace.revision, base + 2);
+        assert_eq!(browser.event.revision, base + 2);
+        assert_eq!(browser.workspace.files["params.scad"], "size = 4;");
+        // A range edit against base + 1 already saw the agent's params.scad, and
+        // only main.scad changed after it, so it lands on the text it was made for.
+        let ranged = patch(
+            &store,
+            &workspace.id,
+            base + 1,
+            json!({"path": "params.scad", "start": 7, "end": 8, "text": "5"}),
+        )
+        .expect("only main.scad changed since base + 1");
+        assert_eq!(ranged.workspace.files["params.scad"], "size = 5;");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_edit_to_the_same_file_still_conflicts() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        patch(&store, &workspace.id, base, json!({"path": "params.scad", "code": "size = 4;"}))
+            .unwrap();
+        let stale = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"path": "params.scad", "code": "size = 5;"}),
+        );
+        assert!(matches!(stale, Err(UpdateError::Conflict(_))), "{stale:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn structural_changes_never_rebase() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        let extra = patch(&store, &workspace.id, base, json!({"path": "extra.scad", "code": ""}))
+            .unwrap()
+            .workspace;
+        // A create of another file is rebased over...
+        patch(&store, &workspace.id, base, json!({"path": "params.scad", "code": "size = 4;"}))
+            .expect("a create elsewhere is not structural for params.scad");
+        let current = store.get(&workspace.id).unwrap().unwrap().revision;
+        // ...but a rename, delete or setMain since the base is not,
+        patch(
+            &store,
+            &workspace.id,
+            current,
+            json!({"op": "rename", "path": "extra.scad", "to": "more.scad"}),
+        )
+        .unwrap();
+        let after_rename = patch(
+            &store,
+            &workspace.id,
+            current,
+            json!({"path": "params.scad", "code": "size = 6;"}),
+        );
+        assert!(matches!(after_rename, Err(UpdateError::Conflict(_))), "{after_rename:?}");
+        // and a structural op itself always needs the current revision.
+        let stale_delete = patch(
+            &store,
+            &workspace.id,
+            extra.revision,
+            json!({"op": "delete", "path": "more.scad"}),
+        );
+        assert!(matches!(stale_delete, Err(UpdateError::Conflict(_))), "{stale_delete:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_base_older_than_the_event_log_conflicts() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        let mut revision = base;
+        for index in 0..=MAX_EVENTS {
+            revision = patch(
+                &store,
+                &workspace.id,
+                revision,
+                json!({"path": "params.scad", "code": format!("size = {index};")}),
+            )
+            .unwrap()
+            .workspace
+            .revision;
+        }
+        let stale = patch(&store, &workspace.id, base, json!({"code": "cube(1);"}));
+        assert!(matches!(stale, Err(UpdateError::Conflict(_))), "{stale:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stateless_renders_overlay_unsaved_text_on_the_workspace() {
+        let (state, root) = temporary_state(None);
+        let workspace = state
+            .workspaces
+            .create_with_settings(
+                engine::Project {
+                    main: "main.scad".into(),
+                    files: BTreeMap::from([
+                        ("main.scad".into(), "include <params.scad>\ncube(size);".into()),
+                        ("params.scad".into(), "size = 3;".into()),
+                    ]),
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let bounds = |project: engine::Project| {
+            let output = engine::compile(project, engine::Quality::Preview, None).unwrap();
+            output
+                .mesh
+                .triangles
+                .iter()
+                .flat_map(|triangle| triangle.vertices)
+                .map(|vertex| vertex.x)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        // Unsaved main-file text, with the stored params.scad.
+        let main = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "code": "include <params.scad>\ncube(size + 1);"}),
+        )
+        .unwrap();
+        assert!((bounds(main) - 4.0).abs() < 1e-6);
+        // Unsaved text of another file, rendered through the main file.
+        let other = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "path": "params.scad", "code": "size = 7;"}),
+        )
+        .unwrap();
+        assert!((bounds(other) - 7.0).abs() < 1e-6);
+        // A file that is not saved yet at all.
+        let new_file = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "path": "new.scad", "code": ""}),
+        )
+        .unwrap();
+        assert!(new_file.files.contains_key("new.scad"));
+        let refused = |input: Value| render_overlay_project(&state, &input).unwrap_err().0;
+        assert_eq!(refused(json!({"workspaceId": workspace.id, "path": "../x.scad", "code": ""})), 400);
+        assert_eq!(
+            render_overlay_project(&state, &json!({"workspaceId": "no-such-workspace-0000", "code": "cube(1);"}))
+                .unwrap(),
+            engine::Project::single("cube(1);")
+        );
+        assert_eq!(refused(json!({"code": "  "})), 400);
+        assert_eq!(
+            render_overlay_project(&state, &json!({"code": "cube(1);"})).unwrap(),
+            engine::Project::single("cube(1);")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

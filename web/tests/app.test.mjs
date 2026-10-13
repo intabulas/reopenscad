@@ -28,13 +28,28 @@ test('the viewport uses the WebGL canvas mesh path', () => {
   assert.doesNotMatch(javascript, /renderImage|data:image\/png;base64/);
 });
 
-test('web shell omits desktop menus and multi-file tab chrome', () => {
+test('web shell omits desktop menus and keeps one editor buffer under the file tabs', () => {
   assert.doesNotMatch(html, /data-menu=|class="menus"|menu-popover/);
-  assert.doesNotMatch(html, /class="tab active"/);
-  // The editor pane carries no header chrome at all: one source buffer, no
-  // file name, no tab strip, no dead "editor settings" affordance.
+  // No dead "editor settings" affordance, and still exactly one source buffer: switching
+  // files swaps its text rather than stacking editors.
   assert.doesNotMatch(html, /class="file-heading"|id="editorSettings"/);
   assert.equal(html.match(/<textarea[^>]*id="codeEditor"/g).length, 1);
+  // One tab per workspace file sits above it.
+  assert.match(html, /<div class="file-tabs" id="fileTabs" role="tablist"/);
+  assert.match(javascript, /function renderFileTabs\(\)/);
+});
+
+test('saves and renders name the file they are for', () => {
+  assert.match(javascript, /body: JSON\.stringify\(\{ path, code, baseRevision, source: 'browser' \}\)/);
+  // The stateless fallback overlays the open file on the stored workspace.
+  assert.match(javascript, /revision: workspaceRevision,\n\s+path: activeFile,/);
+  assert.match(javascript, /workspaceId,\n\s+path: activeFile,/);
+});
+
+test('file operations never use blocking browser dialogs', () => {
+  const block = javascript.slice(javascript.indexOf('// Workspace files: the tab strip'), javascript.indexOf("const splitter = $('#mainSplitter');"));
+  assert.ok(block.length > 1000);
+  assert.doesNotMatch(block, /\b(?:window\.)?(?:confirm|prompt|alert)\(/);
 });
 
 test('scene inspection controls expose objects, visibility, selection, and tolerance', () => {
@@ -276,16 +291,20 @@ test('a read-only view shows the editor, never the catalogue', () => {
   // Every card either types into this editor or makes a workspace, and a
   // reader came here to do neither — a shared blank model is just a blank
   // editor.
-  assert.match(javascript, /const hidden = !empty \|\| kickstartDismissed \|\| Boolean\(readOnlyToken\);/);
-  // `readOnlyToken` is read by `updateKickstart`, which is defined long before
-  // the read-only code; declaring it down there would be a dead-zone trap.
-  const declaration = javascript.indexOf('let readOnlyToken = null;');
-  assert.ok(declaration > 0 && declaration < javascript.indexOf('function updateKickstart'));
+  assert.match(javascript, /const hidden = !blankModel \|\| kickstartDismissed \|\| Boolean\(readOnlyToken\);/);
+  // `updateKickstart` reads these, and is defined long before the code that
+  // owns them; declaring them down there would be a dead-zone trap.
+  for (const declared of ['let readOnlyToken = null;', "let mainFile = 'main.scad';", "let activeFile = 'main.scad';", "let workspaceFiles = ['main.scad'];"]) {
+    const declaration = javascript.indexOf(declared);
+    assert.ok(declaration > 0 && declaration < javascript.indexOf('function updateKickstart'), declared);
+  }
 });
 
-test('an empty editor is not offered a preview it cannot produce', () => {
-  assert.match(javascript, /\$\('#firstPreview'\)\.hidden = empty;/);
-  assert.match(javascript, /\$\('#emptyHint'\)\.hidden = empty;/);
+test('an empty model is not offered a preview it cannot produce', () => {
+  // Blank means an empty one-file workspace; an empty second file still previews main.
+  assert.match(javascript, /const blankModel = empty && activeFile === mainFile && workspaceFiles\.length <= 1;/);
+  assert.match(javascript, /\$\('#firstPreview'\)\.hidden = blankModel;/);
+  assert.match(javascript, /\$\('#emptyHint'\)\.hidden = blankModel;/);
 });
 
 test('one recent workspace is the same size as one of three', () => {

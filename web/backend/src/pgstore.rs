@@ -482,7 +482,7 @@ impl PgWorkspaceStore {
             .get(id)
             .map_err(UpdateError::Internal)?
             .ok_or(UpdateError::NotFound)?;
-        if expected != current.revision {
+        if expected != current.revision && !crate::rebase_allowed(&current, expected, &update) {
             return Err(UpdateError::Conflict(Box::new(current)));
         }
         let planned = plan_edit(&current, &mut update)?;
@@ -516,7 +516,9 @@ impl PgWorkspaceStore {
         let owned = id.to_string();
         let now_i64 = now as i64;
         let cap = MAX_EVENTS as i32;
-        let expected_i64 = expected as i64;
+        // The revision this edit was planned against, which is `expected`
+        // unless it was rebased over edits to other files.
+        let expected_i64 = current.revision as i64;
         let row = self
             .pool
             .with(|client| {
@@ -1302,6 +1304,25 @@ mod tests {
             ["params.scad"]
         );
         assert_eq!(deleted.workspace.events.last().unwrap().path, "box.scad");
+    }
+
+    /// The compare-and-swap uses the revision the edit was planned against, so
+    /// a rebased edit still loses to anything that lands in between.
+    #[test]
+    fn edits_rebase_over_other_files_in_the_database() {
+        let Some(database) = legacy_database() else { return };
+        let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        let created = store
+            .create_with_settings("cube(1);", None, None, None)
+            .unwrap();
+        let params = patch(&store, &created.id, 1, json!({"path": "params.scad", "code": "a = 1;"}))
+            .unwrap();
+        let rebased = patch(&store, &created.id, 1, json!({"code": "cube(2);"}))
+            .expect("main.scad untouched since revision 1");
+        assert_eq!(rebased.workspace.revision, params.workspace.revision + 1);
+        assert_eq!(rebased.workspace.files["params.scad"], "a = 1;");
+        let same_file = patch(&store, &created.id, 1, json!({"path": "params.scad", "code": "a = 2;"}));
+        assert!(matches!(same_file, Err(UpdateError::Conflict(_))), "{same_file:?}");
     }
 
     /// The event log is bounded in SQL, not by a read-modify-write in the
