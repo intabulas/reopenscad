@@ -209,7 +209,7 @@ fn arithmetic_type_errors_and_undef_propagate_without_aborting() {
     let expression = cases.join(" && ");
 
     let output = compile(
-        &format!("if ({expression}) cube(1); else sphere(1);"),
+        format!("if ({expression}) cube(1); else sphere(1);"),
         Quality::Preview,
         None,
     )
