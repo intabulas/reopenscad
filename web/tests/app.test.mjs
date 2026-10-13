@@ -46,6 +46,24 @@ test('saves and renders name the file they are for', () => {
   assert.match(javascript, /workspaceId,\n\s+path: activeFile,/);
 });
 
+test('a read-only view can browse files but not change them', () => {
+  // Readers get the tabs, without the + or the per-file menu.
+  assert.match(javascript, /\(readOnlyToken \? '' : `<button class="file-tab-menu"/);
+  assert.match(javascript, /\(readOnlyToken \? '' : '<button class="file-tab-add"/);
+  assert.doesNotMatch(css, /body\.read-only \.file-tabs \{ display: none; \}/);
+  // Its renders resolve includes through the share token, and a fork copies every file.
+  assert.match(javascript, /shareToken: readOnlyToken,\n\s+projection,/);
+  assert.match(javascript, /createWorkspace\(code, workspaceFiles\.length > 1 \? \{ navigation: 'push', files, main \}/);
+});
+
+test('a save refused as invalid is not treated as the network being down', () => {
+  const start = javascript.indexOf('if (response.status === 422) {');
+  const branch = javascript.slice(start, javascript.indexOf('if (!response.ok) throw', start));
+  assert.match(branch, /workspaceOnline = true;/);
+  assert.match(branch, /setSyncState\('Invalid', 'error'\);/);
+  assert.doesNotMatch(branch, /scheduleWorkspaceSave/);
+});
+
 test('file operations never use blocking browser dialogs', () => {
   const block = javascript.slice(javascript.indexOf('// Workspace files: the tab strip'), javascript.indexOf("const splitter = $('#mainSplitter');"));
   assert.ok(block.length > 1000);

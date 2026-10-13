@@ -3397,6 +3397,11 @@ fn handle_shared_workspace(
                 "ok": true,
                 "readOnly": true,
                 "code": workspace.main_code(),
+                // Every file in full: a reader may see all of them, and the
+                // 2 MiB cap bounds the payload, so the read-only view needs no
+                // token-scoped reader of its own.
+                "main": workspace.main,
+                "files": workspace.files,
                 "revision": workspace.revision,
                 "plate": workspace.plate,
                 "tolerance": workspace.tolerance,
@@ -5042,7 +5047,9 @@ fn mcp_tool_definitions() -> Vec<Value> {
              file stays main under its new name), and `setMain` makes it the file that renders. \
              Names are plain .scad file names without directories, at most 32 files per \
              workspace. Every change is validated as a whole project, so deleting or renaming a \
-             file that another file still includes is refused.",
+             file that another file still includes is refused. An edit whose expectedRevision is \
+             stale is still accepted when every change since then only edited other files; a \
+             delete, rename or setMain always needs the current revision.",
             json!({
                 "type": "object",
                 "required": ["workspaceId", "expectedRevision"],
@@ -5598,11 +5605,12 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
 
 /// What the stateless `/api/render` and `/api/export` compile.
 ///
-/// Plain `code` is a one-file project. With a `workspaceId` it is that
-/// workspace's stored files with `code` laid over `path` (the main file when
-/// absent), so text that is unsaved — or that failed validation and could not
-/// be saved — still compiles with every file it includes. The main file is
-/// what renders either way.
+/// Plain `code` is a one-file project. With a `workspaceId` — or, for a
+/// read-only view, a `shareToken` — it is that workspace's stored files with
+/// `code` laid over `path` (the main file when absent), so text that is
+/// unsaved, or that failed validation and could not be saved, still compiles
+/// with every file it includes. The main file is what renders either way.
+/// Nothing here writes, so a share token grants no more than reading.
 fn render_overlay_project(
     state: &AppState,
     input: &Value,
@@ -5614,16 +5622,26 @@ fn render_overlay_project(
         }
         Ok(engine::Project::single(code))
     };
-    let Some(id) = input
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-    else {
-        return single();
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
     };
-    // A workspace the browser made while the server was unreachable has an id
-    // the server never saw; it renders as the one file it is, as it always did.
-    let Some(workspace) = state.workspaces.get(id).map_err(|error| (500, error))? else {
+    let workspace = if let Some(token) = text("shareToken") {
+        state
+            .workspaces
+            .resolve_share(token)
+            .map_err(|error| (500, error))?
+            .ok_or_else(|| (404, "This read-only link is not valid.".to_string()))?
+    } else if let Some(id) = text("workspaceId") {
+        // A workspace the browser made while the server was unreachable has an
+        // id the server never saw; it renders as the one file it is.
+        match state.workspaces.get(id).map_err(|error| (500, error))? {
+            Some(workspace) => workspace,
+            None => return single(),
+        }
+    } else {
         return single();
     };
     let path = input
@@ -7202,6 +7220,45 @@ mod tests {
         assert_eq!(
             render_overlay_project(&state, &json!({"code": "cube(1);"})).unwrap(),
             engine::Project::single("cube(1);")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn share_tokens_render_every_file_and_nothing_more() {
+        let (state, root) = temporary_state(None);
+        let workspace = state
+            .workspaces
+            .create_with_settings(
+                engine::Project {
+                    main: "box.scad".into(),
+                    files: BTreeMap::from([
+                        ("box.scad".into(), "include <params.scad>\ncube(size);".into()),
+                        ("params.scad".into(), "size = 3;".into()),
+                    ]),
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let token = state.workspaces.share_token(&workspace.id).unwrap();
+        let project = render_overlay_project(
+            &state,
+            &json!({"shareToken": token, "code": "include <params.scad>\ncube(size);"}),
+        )
+        .unwrap();
+        assert_eq!(project.main, "box.scad");
+        assert_eq!(project.files["params.scad"], "size = 3;");
+        let bad = render_overlay_project(
+            &state,
+            &json!({"shareToken": "0".repeat(32), "code": "cube(1);"}),
+        );
+        assert_eq!(bad.unwrap_err().0, 404);
+        // Rendering with the token wrote nothing.
+        assert_eq!(
+            state.workspaces.get(&workspace.id).unwrap().unwrap().revision,
+            workspace.revision
         );
         fs::remove_dir_all(root).unwrap();
     }

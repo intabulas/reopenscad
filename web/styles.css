@@ -124,7 +124,7 @@ button { color: inherit; }
 .file-menu button:hover:not(:disabled) { background: #2a323c; color: #fff; }
 .file-menu button:disabled { color: var(--dim); cursor: default; }
 .file-menu button.confirm { color: var(--red); }
-body.read-only .file-tabs { display: none; }
+
 .editor-overlay { position: absolute; top: 7px; right: 13px; z-index: 4; display: flex; align-items: center; gap: 7px; pointer-events: none; }
 .editor-overlay > * { pointer-events: auto; }
 #dirtyIndicator { width: 5px; height: 5px; border-radius: 50%; background: var(--yellow); opacity: 0; transition: opacity .15s; }

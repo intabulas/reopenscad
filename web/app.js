@@ -311,6 +311,9 @@ let intersectionIds = new Set();
 let eventPollTimer = null;
 let eventPollController = null;
 let workspaceSaveFailures = 0;
+// The last validation error a save was refused with, so a render that flushes the same
+// broken text again does not log it twice.
+let lastInvalidSaveMessage = '';
 let nextWorkspaceNavigation = 'replace';
 // Viewer-settings PATCHes still awaiting a reply, counted per workspace id. A remote payload
 // that predates them is stale for those fields, so it must not apply them back over the user
@@ -1410,7 +1413,9 @@ function normalizeUpdatedRanges(code, ranges) {
 
 // A brand new workspace starts genuinely empty so the kick-start options are what a first
 // visitor sees. `navigation` decides whether the previous workspace stays reachable via Back.
-async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
+// `files` (name to source) and `main` make a multi-file workspace, as a fork of a shared
+// one does; otherwise `code` becomes the main file of a one-file workspace.
+async function createWorkspace(code = '', { navigation = 'replace', files = null, main = null } = {}) {
   leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   nextWorkspaceNavigation = navigation;
@@ -1423,7 +1428,7 @@ async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
       // Seeding the new workspace with the settings on screen is what "preserve it in case
       // the user creates a new workspace" means: the bed carries over instead of resetting.
       body: JSON.stringify({
-        code,
+        ...(files ? { files, main } : { code }),
         plate: localStorage.getItem(PLATE_STORAGE_KEY) || '',
         // `|| DEFAULT` would turn a deliberate 0 mm clearance back into 0.2.
         tolerance: readTolerance() ?? DEFAULT_TOLERANCE,
@@ -1608,7 +1613,23 @@ async function saveWorkspace() {
         storeLocalWorkspace();
         return false;
       }
+      if (response.status === 422) {
+        // The server is fine; the text is not. Saying so once and waiting for the next edit
+        // beats retrying it forever as if the network were down — which also dropped polling
+        // to its offline pace for as long as the file stayed broken.
+        workspaceOnline = true;
+        workspaceSaveFailures = 0;
+        const message = `${path}: ${payload.error || 'invalid source'}`.replace(`${path}: ${path}: `, `${path}: `);
+        if (message !== lastInvalidSaveMessage) log(`Not saved — ${message}`, 'error');
+        lastInvalidSaveMessage = message;
+        storeLocalWorkspace();
+        setSyncState('Invalid', 'error');
+        $('#syncState').title = 'The last edit does not validate, so it is kept locally. Fix it and it saves.';
+        return false;
+      }
       if (!response.ok) throw new Error(`Workspace service returned ${response.status}`);
+      lastInvalidSaveMessage = '';
+      $('#syncState').title = '';
       workspaceOnline = true;
       workspaceSaveFailures = 0;
       const workspace = workspaceFromPayload(payload);
@@ -2045,6 +2066,7 @@ async function render(mode = 'preview') {
       requestId: request.id,
       revision: workspaceRevision,
       path: activeFile,
+      shareToken: readOnlyToken,
       projection,
       camera,
       view: [$('#edgesToggle').checked && 'edges', $('#axesToggle').checked && 'axes'].filter(Boolean),
@@ -2173,6 +2195,7 @@ async function exportModel(format, scope = 'visible') {
       revision: workspaceRevision,
       workspaceId,
       path: activeFile,
+      shareToken: readOnlyToken,
       ...(objectIds ? { objectIds } : {}),
     };
     let response = await fetch(exportUrl, {
@@ -3626,15 +3649,16 @@ function showFile(name, saved, local = saved) {
 }
 
 async function openFile(name) {
-  if (name === activeFile || readOnlyToken || !workspaceId || !workspaceFiles.includes(name)) return;
+  if (name === activeFile || !workspaceFiles.includes(name) || (!workspaceId && !readOnlyToken)) return;
   if (workspaceConflict) {
     log('Resolve the source conflict before switching files.', 'warning');
     return;
   }
   const id = workspaceId;
   const generation = workspaceGeneration;
-  await flushWorkspaceSave();
+  if (id) await flushWorkspaceSave();
   if (generation !== workspaceGeneration || id !== workspaceId) return;
+  // A read-only view loaded every file up front, so its buffers are always present.
   let buffer = fileBuffers.get(name);
   if (!buffer || buffer.saved === null) {
     try {
@@ -3673,9 +3697,9 @@ function renderFileTabs() {
       + '<span class="file-tab-star" aria-hidden="true">★</span>'
       + `<button class="file-tab-name" data-file-open>${escapeHtml(name)}</button>`
       + '<i class="file-tab-dot" aria-hidden="true"></i>'
-      + `<button class="file-tab-menu" data-file-menu aria-label="Actions for ${escapeAttribute(name)}">⋯</button>`
+      + (readOnlyToken ? '' : `<button class="file-tab-menu" data-file-menu aria-label="Actions for ${escapeAttribute(name)}">⋯</button>`)
       + '</div>';
-  }).join('') + '<button class="file-tab-add" data-file-add title="New file" aria-label="New file">+</button>';
+  }).join('') + (readOnlyToken ? '' : '<button class="file-tab-add" data-file-add title="New file" aria-label="New file">+</button>');
 }
 
 function flagFileError(message) {
@@ -3771,8 +3795,8 @@ async function makeMainFile(name) {
   render('preview');
 }
 
-// Swaps a tab's name (or a new tab at the end of the strip) for an input. Enter commits;
-// Escape or leaving the field cancels.
+// Swaps a tab's name (or a new tab at the end of the strip) for an input. Enter or leaving
+// the field commits; Escape cancels.
 function editFileName(initial, onCommit, tab = null) {
   const strip = $('#fileTabs');
   const holder = tab || Object.assign(document.createElement('div'), { className: 'file-tab active' });
@@ -3799,7 +3823,8 @@ function editFileName(initial, onCommit, tab = null) {
     if (event.key === 'Enter') { event.preventDefault(); finish(true); }
     if (event.key === 'Escape') { event.preventDefault(); finish(false); }
   });
-  input.addEventListener('blur', () => finish(false));
+  // Clicking away keeps what was typed; only Escape throws it away.
+  input.addEventListener('blur', () => finish(true));
 }
 
 let fileMenuTarget = null;
@@ -3918,7 +3943,19 @@ async function loadSharedWorkspace(token) {
     const response = await fetch(`/api/shared/${encodeURIComponent(token)}`);
     if (!response.ok) throw new Error(`shared ${response.status}`);
     const payload = await response.json();
+    // Every file comes in the payload, so switching tabs here never asks the server.
+    const files = payload.files && typeof payload.files === 'object' ? payload.files : {};
+    if (typeof payload.main === 'string' && typeof files[payload.main] === 'string') {
+      mainFile = payload.main;
+      activeFile = payload.main;
+      workspaceFiles = Object.keys(files).sort();
+      for (const [name, source] of Object.entries(files)) {
+        if (name !== mainFile) fileBuffers.set(name, { saved: source, local: source });
+      }
+      renderFileTabs();
+    }
     editor.value = typeof payload.code === 'string' ? payload.code : '';
+    workspaceSavedCode = editor.value;
     syncEditor(false);
     applyWorkspaceSettings(payload);
     $('#workspaceName').textContent = 'Shared view';
@@ -3945,8 +3982,13 @@ function leaveReadOnly() {
 // permission they do not have.
 $('#forkWorkspace').addEventListener('click', async () => {
   const code = editor.value;
+  const files = Object.fromEntries([
+    ...[...fileBuffers].map(([name, buffer]) => [name, buffer.local]),
+    [activeFile, code],
+  ]);
+  const main = mainFile;
   leaveReadOnly();
-  await createWorkspace(code, { navigation: 'push' });
+  await createWorkspace(code, workspaceFiles.length > 1 ? { navigation: 'push', files, main } : { navigation: 'push' });
   if (editor.value.trim()) render('preview');
 });
 
