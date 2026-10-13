@@ -133,6 +133,13 @@ startup, idempotently, under a Postgres advisory lock so cold-starting
 instances cannot race. `backend/sql/schema.sql` reproduces the statements for
 review; applying it by hand makes the startup migration a no-op.
 
+Rolling back to a build from before multi-file workspaces is safe. Migration
+4 keeps the old `code` column as a copy of each workspace's main file, and a
+trigger copies an older build's writes to `code` back into `files`, so the
+two builds can also serve side by side during a deploy. An older build sees
+only the main file. A later migration drops the column and the trigger
+together, and rollback past that point is not supported.
+
 ### The connection string
 
 Attaching the instance mounts a unix socket at

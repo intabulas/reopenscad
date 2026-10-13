@@ -35,9 +35,10 @@ use postgres::{Client, Config, Row};
 use serde_json::Value;
 
 use crate::{
-    default_workspace_name, normalize_source, sanitize_name, sanitize_plate, sanitize_tolerance,
-    unix_millis, valid_workspace_id, validate_source, EditResult, UpdateError, Workspace,
-    WorkspaceEvent, WorkspaceUpdate, DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
+    default_main_file, default_workspace_name, normalize_source, plan_edit, sanitize_name,
+    sanitize_plate, sanitize_tolerance, single_file, unix_millis, valid_workspace_id, EditResult,
+    PlannedEdit, UpdateError, Workspace, WorkspaceEvent, WorkspaceUpdate, DEFAULT_TOLERANCE,
+    MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
 };
 
 /// Idle connections kept alive between requests. The server is thread-per-
@@ -71,8 +72,11 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 /// stable arbitrary constant works; this one is "reopenscad" in hex-ish form.
 const MIGRATION_LOCK_KEY: i64 = 0x_7265_6f70_656e_0001;
 
-const SELECT_COLUMNS: &str =
-    "id, name, code, revision, created_at, updated_at, plate, tolerance, preview, share_token, events";
+/// `code` is deliberately absent: it is a write-only copy of the main file
+/// kept for older builds (see migration 4), and reading it would stream every
+/// main file out of the database twice.
+const SELECT_COLUMNS: &str = "id, name, main, files, revision, created_at, updated_at, plate, \
+                              tolerance, preview, share_token, events";
 
 /// The retained-workspace ceiling, from `REOPENSCAD_MAX_WORKSPACES`.
 ///
@@ -329,6 +333,10 @@ impl PgWorkspaceStore {
         let config = Config::from_str(url).map_err(|error| {
             format!("DATABASE_URL is not a valid Postgres connection string: {error}")
         })?;
+        Self::open_config(config)
+    }
+
+    fn open_config(config: Config) -> Result<Self, String> {
         let pool = Arc::new(Pool::new(config));
         pool.with(migrate)?;
         let store = Self {
@@ -390,6 +398,11 @@ impl PgWorkspaceStore {
         }
         let now = unix_millis() as i64;
         let name = sanitize_name(name);
+        let main = default_main_file();
+        let files = single_file(code);
+        let files_json =
+            serde_json::to_value(&files).map_err(|error| format!("Workspace files: {error}"))?;
+        let code = files[&main].as_str();
         let plate = plate.as_deref().map(sanitize_plate).unwrap_or_default();
         let tolerance = tolerance.map(sanitize_tolerance).unwrap_or(DEFAULT_TOLERANCE);
         // Ids carry 112 bits of entropy, so a collision is theoretical; the
@@ -399,17 +412,20 @@ impl PgWorkspaceStore {
             let inserted = self.pool.with(|client| {
                 client.execute(
                     "INSERT INTO workspaces
-                         (id, name, code, revision, created_at, updated_at, plate, tolerance, events)
-                     VALUES ($1, $2, $3, 1, $4, $4, $5, $6, '[]'::jsonb)
+                         (id, name, main, files, code, revision, created_at, updated_at,
+                          plate, tolerance, events)
+                     VALUES ($1, $2, $3, $4, $5, 1, $6, $6, $7, $8, '[]'::jsonb)
                      ON CONFLICT (id) DO NOTHING",
-                    &[&id, &name, &code, &now, &plate, &tolerance],
+                    &[&id, &name, &main, &files_json, &code, &now, &plate, &tolerance],
                 )
             })?;
             if inserted == 1 {
                 return Ok(Workspace {
                     id,
                     name,
-                    code,
+                    main,
+                    files,
+                    legacy_code: String::new(),
                     revision: 1,
                     created_at: now as u64,
                     updated_at: now as u64,
@@ -455,7 +471,7 @@ impl PgWorkspaceStore {
         Ok(row.map(|row| row.get::<_, i64>(0).max(0) as u64))
     }
 
-    pub fn update(&self, id: &str, update: WorkspaceUpdate) -> Result<EditResult, UpdateError> {
+    pub fn update(&self, id: &str, mut update: WorkspaceUpdate) -> Result<EditResult, UpdateError> {
         let expected = update
             .expected_revision
             .or(update.base_revision)
@@ -469,40 +485,18 @@ impl PgWorkspaceStore {
             .map_err(UpdateError::Internal)?
             .ok_or(UpdateError::NotFound)?;
         if expected != current.revision {
-            return Err(UpdateError::Conflict(current));
+            return Err(UpdateError::Conflict(Box::new(current)));
         }
-        let (code, start, end, inserted_length) = if let Some(code) = update.code {
-            let old_len = current.code.len();
-            let new_len = code.len();
-            (code, 0, old_len, new_len)
-        } else {
-            let start = update.start.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let end = update.end.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let text = update.text.unwrap_or_default();
-            if start > end
-                || end > current.code.len()
-                || !current.code.is_char_boundary(start)
-                || !current.code.is_char_boundary(end)
-            {
-                return Err(UpdateError::Invalid(
-                    "Edit range must use valid UTF-8 byte offsets within the document.".into(),
-                ));
-            }
-            let mut code = current.code.clone();
-            code.replace_range(start..end, &text);
-            let inserted_length = text.len();
-            (code, start, end, inserted_length)
-        };
-        if code.len() > MAX_BODY {
-            return Err(UpdateError::Invalid(
-                "Workspace code exceeds the 2 MiB limit.".into(),
-            ));
-        }
-        validate_source(&code).map_err(UpdateError::Validation)?;
+        let PlannedEdit {
+            files,
+            start,
+            end,
+            inserted_length,
+        } = plan_edit(&current, &mut update)?;
+        let files_json = serde_json::to_value(&files)
+            .map_err(|error| UpdateError::Internal(error.to_string()))?;
+        // The legacy `code` column follows the main file; see migration 4.
+        let code = files.get(&current.main).map_or("", String::as_str);
 
         let now = unix_millis();
         let event = WorkspaceEvent {
@@ -542,6 +536,7 @@ impl PgWorkspaceStore {
                     &format!(
                         "UPDATE workspaces SET
                              code = $1,
+                             files = $10,
                              name = COALESCE($2, name),
                              plate = COALESCE($3, plate),
                              tolerance = COALESCE($4, tolerance),
@@ -562,6 +557,7 @@ impl PgWorkspaceStore {
                         &appended,
                         &owned,
                         &expected_i64,
+                        &files_json,
                     ],
                 )
             })
@@ -574,7 +570,7 @@ impl PgWorkspaceStore {
             // Zero rows means either the workspace vanished or somebody else
             // moved the revision between our read and our write.
             None => match self.get(id).map_err(UpdateError::Internal)? {
-                Some(latest) => Err(UpdateError::Conflict(latest)),
+                Some(latest) => Err(UpdateError::Conflict(Box::new(latest))),
                 None => Err(UpdateError::NotFound),
             },
         }
@@ -723,6 +719,10 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
     }
     let name: String = column(row, "name")?;
     let events: Value = column(row, "events")?;
+    let files = serde_json::from_value(column::<Value>(row, "files")?).map_err(|error| {
+        eprintln!("workspace row column `files` is not a name-to-source map: {error}");
+        "The stored workspace could not be read.".to_string()
+    })?;
     Ok(Workspace {
         id: column(row, "id")?,
         name: if name.trim().is_empty() {
@@ -730,7 +730,9 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
         } else {
             name
         },
-        code: column(row, "code")?,
+        main: column(row, "main")?,
+        files,
+        legacy_code: String::new(),
         revision: column::<i64>(row, "revision")?.max(0) as u64,
         created_at: column::<i64>(row, "created_at")?.max(0) as u64,
         updated_at: column::<i64>(row, "updated_at")?.max(0) as u64,
@@ -759,6 +761,12 @@ fn row_to_workspace(row: &Row) -> Result<Workspace, String> {
 /// together. An advisory lock needs no table of its own, so it can be taken
 /// before the bookkeeping table exists.
 fn migrate(client: &mut Client) -> Result<(), postgres::Error> {
+    migrate_through(client, i32::MAX)
+}
+
+/// Applies every migration up to and including `last`. Only the tests stop
+/// short, to build a database as an older build left it.
+fn migrate_through(client: &mut Client, last: i32) -> Result<(), postgres::Error> {
     let mut transaction = client.transaction()?;
     transaction.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_KEY])?;
     transaction.batch_execute(
@@ -773,7 +781,7 @@ fn migrate(client: &mut Client) -> Result<(), postgres::Error> {
         .map(|row| row.get::<_, i32>(0))
         .collect();
     for (version, statements) in MIGRATIONS {
-        if applied.contains(version) {
+        if applied.contains(version) || *version > last {
             continue;
         }
         for statement in *statements {
@@ -825,6 +833,43 @@ const MIGRATIONS: &[(i32, &[&str])] = &[(
         "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS share_token TEXT NOT NULL DEFAULT ''",
         "CREATE UNIQUE INDEX IF NOT EXISTS workspaces_share_token_idx
              ON workspaces (share_token) WHERE share_token <> ''",
+    ],
+), (
+    4,
+    &[
+        // Multi-file workspaces. Every existing row is backfilled in this same
+        // transaction, so no reader ever sees a row without `files`.
+        "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS main TEXT NOT NULL DEFAULT 'main.scad'",
+        "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS files JSONB",
+        "UPDATE workspaces SET files = jsonb_build_object(main, code) WHERE files IS NULL",
+        "ALTER TABLE workspaces ALTER COLUMN files SET NOT NULL",
+        // `code` stays, as a copy of the main file this build keeps writing,
+        // because during a rolling deploy — and after a rollback — a build
+        // from before `files` is still reading and writing it. That build
+        // knows nothing about `files`, so this trigger translates for it: an
+        // INSERT without `files`, or an UPDATE that changes `code` but leaves
+        // `files` alone, can only have come from it, and is copied into the
+        // main file. Without this an edit made through an old instance during
+        // the deploy window would be invisible to new ones. A later migration
+        // drops the trigger and the column together.
+        "CREATE OR REPLACE FUNCTION reopenscad_sync_legacy_code() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF TG_OP = 'INSERT' THEN
+                 IF NEW.files IS NULL THEN
+                     NEW.files := jsonb_build_object(NEW.main, NEW.code);
+                 END IF;
+             ELSIF NEW.code IS DISTINCT FROM OLD.code
+                   AND NEW.files IS NOT DISTINCT FROM OLD.files THEN
+                 NEW.files := jsonb_set(NEW.files, ARRAY[NEW.main], to_jsonb(NEW.code));
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS workspaces_sync_legacy_code ON workspaces",
+        "CREATE TRIGGER workspaces_sync_legacy_code
+             BEFORE INSERT OR UPDATE ON workspaces
+             FOR EACH ROW EXECUTE FUNCTION reopenscad_sync_legacy_code()",
     ],
 )];
 
@@ -896,7 +941,7 @@ mod tests {
             .create_with_settings("cube(1);".into(), Some("Test".into()), None, None)
             .unwrap();
         let loaded = store.get(&created.id).unwrap().expect("persisted");
-        assert_eq!(loaded.code, "cube(1);");
+        assert_eq!(loaded.main_code(), "cube(1);");
         assert_eq!(loaded.revision, 1);
         assert_eq!(store.revision_of(&created.id).unwrap(), Some(1));
     }
@@ -965,7 +1010,7 @@ mod tests {
             .iter()
             .find_map(|result| result.as_ref().ok())
             .unwrap();
-        assert_eq!(final_state.code, winner.workspace.code);
+        assert_eq!(final_state.main_code(), winner.workspace.main_code());
     }
 
     /// Viewer settings take the revisionless path, so a plate change must not
@@ -1021,12 +1066,137 @@ mod tests {
             )
             .expect("a settings write must not consume the revision")
             .workspace;
-        assert_eq!(saved.code, "cube(2);");
+        assert_eq!(saved.main_code(), "cube(2);");
         assert_eq!(saved.revision, created.revision + 1);
         assert_eq!(saved.plate, "prusa-mk4", "the plate was clobbered");
         assert!((saved.tolerance - 0.4).abs() < 1e-9, "{}", saved.tolerance);
         // The name was never supplied either, so it must be untouched.
         assert_eq!(saved.name, created.name);
+    }
+
+    /// A database exactly as the pre-`files` build left it, in a schema of its
+    /// own so it can start from migration 3 whatever the shared test database
+    /// is already at. Dropped by the returned guard.
+    struct LegacyDatabase {
+        config: Config,
+        schema: String,
+        admin: Client,
+    }
+
+    impl Drop for LegacyDatabase {
+        fn drop(&mut self) {
+            let _ = self
+                .admin
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema));
+        }
+    }
+
+    fn legacy_database() -> Option<LegacyDatabase> {
+        let url = std::env::var("REOPENSCAD_TEST_DATABASE_URL").ok()?;
+        let base = Config::from_str(&url).expect("test database url");
+        let schema = format!("legacy_{}", crate::generate_workspace_id(&AtomicU64::new(0)))
+            .replace('-', "_");
+        let mut admin = connect(&base).expect("test database");
+        admin
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .unwrap();
+        let mut config = base;
+        config.options(&format!("-c search_path={schema}"));
+        migrate_through(&mut connect(&config).unwrap(), 3).unwrap();
+        Some(LegacyDatabase {
+            config,
+            schema,
+            admin,
+        })
+    }
+
+    /// The INSERT and UPDATE a build from before `files` issues, verbatim.
+    const LEGACY_INSERT: &str = "INSERT INTO workspaces
+             (id, name, code, revision, created_at, updated_at, plate, tolerance, events)
+         VALUES ($1, 'Old', $2, 1, 0, 0, '', 0.2, '[]'::jsonb)";
+    const LEGACY_UPDATE: &str = "UPDATE workspaces SET code = $1, revision = revision + 1
+         WHERE id = $2";
+
+    #[test]
+    fn migration_4_moves_every_existing_workspace_into_files() {
+        let Some(database) = legacy_database() else { return };
+        let mut old = connect(&database.config).unwrap();
+        let ids = ["aaaaaaaa-old-workspace-one", "aaaaaaaa-old-workspace-two"];
+        for (id, code) in ids.iter().zip(["cube(1);", ""]) {
+            old.execute(LEGACY_INSERT, &[id, &code]).unwrap();
+        }
+
+        let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        for (id, code) in ids.iter().zip(["cube(1);", ""]) {
+            let migrated = store.get(id).unwrap().expect("still there");
+            assert_eq!(migrated.main, "main.scad");
+            assert_eq!(migrated.files, single_file(code.into()));
+            assert_eq!(migrated.revision, 1);
+        }
+        // Running the migrations again is a no-op.
+        PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        let versions: Vec<i32> = old
+            .query("SELECT version FROM reopenscad_schema ORDER BY version", &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(versions, [1, 2, 3, 4]);
+    }
+
+    /// The deploy window: an instance of the old build keeps writing `code`
+    /// after the new build has migrated the table.
+    #[test]
+    fn writes_from_an_older_build_reach_the_main_file() {
+        let Some(database) = legacy_database() else { return };
+        let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        let mut old = connect(&database.config).unwrap();
+
+        let id = "aaaaaaaa-inserted-by-old-build";
+        old.execute(LEGACY_INSERT, &[&id, &"cube(2);"]).unwrap();
+        assert_eq!(
+            store.get(id).unwrap().unwrap().files,
+            single_file("cube(2);".into())
+        );
+
+        old.execute(LEGACY_UPDATE, &[&"cube(3);", &id]).unwrap();
+        let updated = store.get(id).unwrap().unwrap();
+        assert_eq!(updated.main_code(), "cube(3);");
+        assert_eq!(updated.revision, 2);
+    }
+
+    /// And the rollback: the new build keeps `code` current, so an older
+    /// build reading the row afterwards sees the latest main file.
+    #[test]
+    fn the_new_build_keeps_the_code_column_current() {
+        let Some(database) = legacy_database() else { return };
+        let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        let created = store
+            .create_with_settings("cube(1);".into(), None, None, None)
+            .unwrap();
+        store
+            .update(
+                &created.id,
+                WorkspaceUpdate {
+                    code: Some("cube(4);".into()),
+                    name: None,
+                    start: None,
+                    end: None,
+                    text: None,
+                    expected_revision: Some(created.revision),
+                    base_revision: None,
+                    plate: None,
+                    tolerance: None,
+                    source: "browser".into(),
+                },
+            )
+            .unwrap();
+        let mut old = connect(&database.config).unwrap();
+        let code: String = old
+            .query_one("SELECT code FROM workspaces WHERE id = $1", &[&created.id])
+            .unwrap()
+            .get(0);
+        assert_eq!(code, "cube(4);");
     }
 
     /// The event log is bounded in SQL, not by a read-modify-write in the
