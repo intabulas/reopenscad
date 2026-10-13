@@ -56,6 +56,19 @@ test('a read-only view can browse files but not change them', () => {
   assert.match(javascript, /createWorkspace\(code, workspaceFiles\.length > 1 \? \{ navigation: 'push', files, main \}/);
 });
 
+test('an AI edit to a closed file is highlighted when the file is opened', () => {
+  const noted = javascript.slice(javascript.indexOf('function noteRemoteFileEvents'), javascript.indexOf('async function reconcileRemoteFileEvents'));
+  // Held per file, newest AI revision only, dropped by a later human edit, a delete or a reset.
+  assert.match(noted, /if \(!ai\) pendingAiRanges\.delete\(path\);/);
+  assert.match(noted, /else pendingAiRanges\.set\(path, \{ revision, ranges: \[event\] \}\);/);
+  assert.match(noted, /pendingAiRanges\.set\(event\.to, pendingAiRanges\.get\(path\)\);/);
+  assert.match(javascript, /pendingAiRanges\.clear\(\);/);
+  // Consumed on open, and never laid over an unsaved draft.
+  const shown = javascript.slice(javascript.indexOf('function showFile'), javascript.indexOf('async function openFile'));
+  assert.match(shown, /aiUpdatedRanges = pending && local === saved \? normalizeUpdatedRanges\(local, pending\.ranges\) : \[\];/);
+  assert.match(shown, /pendingAiRanges\.delete\(name\);/);
+});
+
 test('a save refused as invalid is not treated as the network being down', () => {
   const start = javascript.indexOf('if (response.status === 422) {');
   const branch = javascript.slice(start, javascript.indexOf('if (!response.ok) throw', start));

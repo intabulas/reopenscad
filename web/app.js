@@ -305,6 +305,11 @@ let workspaceFiles = ['main.scad'];
 const fileBuffers = new Map();
 // Tabs showing a dot for a remote change the user has not opened yet.
 const filesChangedRemotely = new Set();
+// For files not on screen: the events of the latest AI revision that changed each one, held
+// until the file is opened so its edit can be highlighted then. Only the latest revision is
+// kept because only its byte ranges describe the file's current text (`finalAiUpdate` makes
+// the same choice for the open file).
+const pendingAiRanges = new Map();
 let sceneObjects = [];
 let selectedObjectId = null;
 let intersectionIds = new Set();
@@ -1246,6 +1251,7 @@ function resetWorkspaceFiles() {
   workspaceFiles = ['main.scad'];
   fileBuffers.clear();
   filesChangedRemotely.clear();
+  pendingAiRanges.clear();
   renderFileTabs();
 }
 
@@ -3560,10 +3566,15 @@ function noteRemoteFileEvents(events) {
       const buffer = fileBuffers.get(path);
       if (buffer) { fileBuffers.delete(path); fileBuffers.set(event.to, buffer); }
       if (filesChangedRemotely.delete(path)) filesChangedRemotely.add(event.to);
+      if (pendingAiRanges.has(path)) {
+        pendingAiRanges.set(event.to, pendingAiRanges.get(path));
+        pendingAiRanges.delete(path);
+      }
       if (path === activeFile) activeFile = event.to;
     } else if (event.kind === 'delete') {
       fileBuffers.delete(path);
       filesChangedRemotely.delete(path);
+      pendingAiRanges.delete(path);
       if (path === activeFile) outcome.deletedActive = true;
     } else if (event.kind === 'setMain') {
       if (ai) outcome.aiChangedModel = true;
@@ -3576,6 +3587,13 @@ function noteRemoteFileEvents(events) {
       else fileBuffers.delete(path);
       filesChangedRemotely.add(path);
       if (ai) outcome.aiChangedModel = true;
+      // Events arrive in revision order. A newer AI revision replaces what was held; a
+      // non-AI edit after it means the held ranges no longer describe the text.
+      const revision = Number(event.revision);
+      const pending = pendingAiRanges.get(path);
+      if (!ai) pendingAiRanges.delete(path);
+      else if (pending?.revision === revision) pending.ranges.push(event);
+      else pendingAiRanges.set(path, { revision, ranges: [event] });
     }
   }
   return outcome;
@@ -3635,8 +3653,13 @@ function showFile(name, saved, local = saved) {
   editor.value = local;
   workspaceSavedCode = saved;
   workspaceHasLocalChanges = local !== saved;
-  aiUpdatedRanges = [];
-  $('#aiRevisionBadge').hidden = true;
+  // An AI edit made while this file was closed is highlighted now, as it would have been had
+  // the file been open. Not over an unsaved draft: the ranges describe the saved text.
+  const pending = pendingAiRanges.get(name);
+  pendingAiRanges.delete(name);
+  aiUpdatedRanges = pending && local === saved ? normalizeUpdatedRanges(local, pending.ranges) : [];
+  $('#aiRevisionBadge').hidden = !aiUpdatedRanges.length;
+  if (aiUpdatedRanges.length) log(`AI updated ${name} (workspace revision ${pending.revision}).`, 'success');
   dirtyIndicator.classList.toggle('visible', workspaceHasLocalChanges);
   syncEditor(false);
   applyingRemoteUpdate = false;
