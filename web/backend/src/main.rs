@@ -170,7 +170,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
 /// Shared by legacy `initialize` and modern `server/discover` so the two eras
 /// describe the server identically.
-const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of the source in a local .scad file and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
+const MCP_INSTRUCTIONS: &str = "Create and edit SCAD workspaces, then render or export them. A workspace holds up to 32 .scad files; its main file is the one that renders, and `include <name.scad>` / `use <name.scad>` reach the other files by exact name (the bundled units.scad and shapes.scad are also available). Create a file by sending `code` for a new `path` to update_workspace_code, and delete, rename or change the main file with its `op`. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of every file locally and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
 
 #[derive(Clone)]
 struct AppState {
@@ -402,6 +402,7 @@ struct PersistedWorkspace<'a> {
 }
 
 /// The files a fresh workspace holding `code` starts with.
+#[cfg(test)]
 fn single_file(code: String) -> BTreeMap<String, String> {
     BTreeMap::from([(engine::DEFAULT_MAIN_FILE.to_string(), code)])
 }
@@ -456,6 +457,89 @@ fn valid_file_name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         && !stem.contains("..")
+}
+
+/// The files a create request asks for: either `code`, which becomes the
+/// main file of a one-file workspace, or `files` (name to source) with an
+/// optional `main`. `main` may be omitted when the files include `main.scad`
+/// or there is only one file. Held to the same name, count, size and
+/// validation rules as files saved by an edit.
+fn initial_project(input: &Value) -> Result<engine::Project, UpdateError> {
+    let Some(files) = input.get("files") else {
+        let code = input
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_SOURCE);
+        let project = engine::Project::single(code);
+        if total_source_bytes(&project.files) > MAX_BODY {
+            return Err(UpdateError::Invalid(
+                "Workspace code exceeds the 2 MiB limit.".into(),
+            ));
+        }
+        validate_source(&project).map_err(UpdateError::Validation)?;
+        return Ok(project);
+    };
+    if input.get("code").is_some() {
+        return Err(UpdateError::Invalid(
+            "Send either `code` or `files`, not both.".into(),
+        ));
+    }
+    let files = files
+        .as_object()
+        .ok_or_else(|| UpdateError::Invalid("`files` must map file names to sources.".into()))?
+        .iter()
+        .map(|(name, source)| {
+            let source = source.as_str().ok_or_else(|| {
+                UpdateError::Invalid(format!("The source of {name:?} must be a string."))
+            })?;
+            if !valid_file_name(name) {
+                return Err(file_name_error(name));
+            }
+            Ok((name.clone(), source.to_string()))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if files.is_empty() {
+        return Err(UpdateError::Invalid("`files` must hold at least one file.".into()));
+    }
+    if files.len() > MAX_FILES {
+        return Err(UpdateError::Invalid(format!(
+            "A workspace holds at most {MAX_FILES} files."
+        )));
+    }
+    if total_source_bytes(&files) > MAX_BODY {
+        return Err(UpdateError::Invalid(
+            "Workspace code exceeds the 2 MiB limit.".into(),
+        ));
+    }
+    let main = match input.get("main").and_then(Value::as_str) {
+        Some(main) if files.contains_key(main) => main.to_string(),
+        Some(main) => return Err(missing_file_error(main)),
+        None if files.contains_key(engine::DEFAULT_MAIN_FILE) => default_main_file(),
+        None if files.len() == 1 => files.keys().next().cloned().unwrap_or_default(),
+        None => {
+            return Err(UpdateError::Invalid(
+                "Name the file that renders with `main`.".into(),
+            ))
+        }
+    };
+    let mut project = engine::Project { main, files };
+    validate_source(&project).map_err(UpdateError::Validation)?;
+    // Every other file must also validate on its own, as it would have to if
+    // it were saved later by an edit (see `plan_edit`).
+    let main = std::mem::take(&mut project.main);
+    let others = project
+        .files
+        .keys()
+        .filter(|name| **name != main)
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in others {
+        project.main = name;
+        validate_source(&project)
+            .map_err(|error| UpdateError::Validation(format!("{}: {error}", project.main)))?;
+    }
+    project.main = main;
+    Ok(project)
 }
 
 fn file_name_error(name: &str) -> UpdateError {
@@ -882,12 +966,13 @@ impl WorkspaceStore {
     /// a brand new workspace.
     fn create_with_settings(
         &self,
-        code: String,
+        source: impl Into<engine::Project>,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
     ) -> Result<Workspace, String> {
-        if code.len() > MAX_BODY {
+        let project = source.into();
+        if total_source_bytes(&project.files) > MAX_BODY {
             return Err("Workspace code exceeds the 2 MiB limit.".into());
         }
         let now = unix_millis();
@@ -907,8 +992,8 @@ impl WorkspaceStore {
             share_token: String::new(),
             id: id.clone(),
             name: sanitize_name(name),
-            main: default_main_file(),
-            files: single_file(code),
+            main: project.main,
+            files: project.files,
             legacy_code: String::new(),
             revision: 1,
             created_at: now,
@@ -1143,21 +1228,17 @@ enum Store {
 }
 
 impl Store {
-    fn create(&self, code: String, name: Option<String>) -> Result<Workspace, String> {
-        self.create_with_settings(code, name, None, None)
-    }
-
     fn create_with_settings(
         &self,
-        code: String,
+        source: impl Into<engine::Project>,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
     ) -> Result<Workspace, String> {
         match self {
-            Self::Filesystem(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Filesystem(store) => store.create_with_settings(source, name, plate, tolerance),
             #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Postgres(store) => store.create_with_settings(source, name, plate, tolerance),
         }
     }
 
@@ -3089,14 +3170,12 @@ fn handle_create_workspace(
         Ok(value) => value,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let code = input
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SOURCE)
-        .to_string();
-    if let Err(error) = validate_source(&code) {
-        return respond_validation_error(stream, error);
-    }
+    let project = match initial_project(&input) {
+        Ok(project) => project,
+        Err(UpdateError::Validation(error)) => return respond_validation_error(stream, error),
+        Err(UpdateError::Invalid(error)) => return respond_error(stream, 400, &error),
+        Err(_) => return respond_error(stream, 400, "Invalid workspace."),
+    };
     let name = input
         .get("name")
         .and_then(Value::as_str)
@@ -3110,7 +3189,7 @@ fn handle_create_workspace(
     let tolerance = input.get("tolerance").and_then(Value::as_f64);
     match state
         .workspaces
-        .create_with_settings(code, name, plate, tolerance)
+        .create_with_settings(project, name, plate, tolerance)
     {
         Ok(workspace) => respond_workspace(stream, 201, state, request, &workspace, None),
         Err(error) => respond_error(stream, 500, &error),
@@ -4872,16 +4951,28 @@ fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         mcp_tool(
             "create_workspace",
-            "Create a single-file SCAD workspace and return its browser URL. \
-             The workspace does not expire, but a deployment holds a bounded number of them and \
-             evicts the least recently touched one when it is full, so save the SCAD source to a \
-             local .scad file (for example alongside the user's project) and treat that file as \
-             the source of truth. The returned URL is an access capability: anyone with the link \
-             can read and change the work, so share it deliberately and never post it publicly.",
+            "Create a SCAD workspace and return its browser URL. Pass `code` for a one-file \
+             workspace (its file is main.scad), or `files` to upload a multi-file project in one \
+             call, e.g. {\"files\": {\"main.scad\": \"include <params.scad>\\ncube(size);\", \
+             \"params.scad\": \"size = 10;\"}}. The whole project is validated before it is \
+             created. The workspace does not expire, but a deployment holds a bounded number of \
+             them and evicts the least recently touched one when it is full, so save every file \
+             locally (for example alongside the user's project) and treat those files as the \
+             source of truth. The returned URL is an access capability: anyone with the link can \
+             read and change the work, so share it deliberately and never post it publicly.",
             json!({
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Initial SCAD source."},
+                    "code": {"type": "string", "description": "Initial SCAD source of a one-file workspace."},
+                    "files": {
+                        "type": "object",
+                        "description": "File name to SCAD source, instead of `code`. Names are plain .scad file names without directories.",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "main": {
+                        "type": "string",
+                        "description": "Which of `files` renders. Optional when the files include main.scad or there is only one."
+                    },
                     "name": {"type": "string"}
                 }
             }),
@@ -4893,7 +4984,9 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "get_workspace_code",
-            "Read all or a UTF-8 byte range of workspace source to minimize token usage.",
+            "Read all or a UTF-8 byte range of one workspace file to minimize token usage. \
+             `path` names the file; the main file is read when it is omitted. \
+             list_workspace_objects and get_workspace_link list the files.",
             json!({
                 "type": "object",
                 "required": ["workspaceId"],
@@ -4907,7 +5000,14 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "update_workspace_code",
-            "Validate and atomically replace source or apply one partial UTF-8 byte-range edit.",
+            "Change one workspace file and bump the revision. `path` names the file (default: \
+             the main file). With the default op, send `code` to replace the file — or create \
+             it, if no file has that name — or start/end/text for one UTF-8 byte-range edit. \
+             op `delete` removes `path` (not the main file), `rename` moves it to `to` (the main \
+             file stays main under its new name), and `setMain` makes it the file that renders. \
+             Names are plain .scad file names without directories, at most 32 files per \
+             workspace. Every change is validated as a whole project, so deleting or renaming a \
+             file that another file still includes is refused.",
             json!({
                 "type": "object",
                 "required": ["workspaceId", "expectedRevision"],
@@ -5096,17 +5196,18 @@ fn mcp_create_workspace(
     // The compute permit for this tool is taken by `mcp_call_tool`, which is
     // the only place that can turn a refusal into a tool result an agent can
     // act on.
-    let code = arguments
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SOURCE)
-        .to_string();
-    validate_source(&code).map_err(|error| format!("SCAD validation failed: {error}"))?;
+    let project = initial_project(arguments).map_err(|error| match error {
+        UpdateError::Validation(error) => format!("SCAD validation failed: {error}"),
+        UpdateError::Invalid(error) | UpdateError::Internal(error) => error,
+        UpdateError::NotFound | UpdateError::Conflict(_) => "Invalid workspace.".into(),
+    })?;
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let workspace = state.workspaces.create(code, name)?;
+    let workspace = state
+        .workspaces
+        .create_with_settings(project, name, None, None)?;
     let objects = workspace_object_summaries(workspace.project());
     Ok(json!({
         "ok": true,
@@ -5287,6 +5388,8 @@ fn mcp_list_workspace_objects(state: &AppState, arguments: &Value) -> Result<Val
         "ok": true,
         "workspaceId": id,
         "revision": workspace.revision,
+        "main": workspace.main,
+        "files": workspace_file_summaries(&workspace),
         "objects": compiled
             .parts
             .iter()
@@ -5301,13 +5404,16 @@ fn mcp_workspace_link(
     arguments: &Value,
 ) -> Result<Value, String> {
     let id = argument_workspace_id(arguments)?;
-    state
+    let workspace = state
         .workspaces
         .get(id)?
         .ok_or_else(|| "Workspace not found.".to_string())?;
     Ok(json!({
         "ok": true,
         "workspaceId": id,
+        "revision": workspace.revision,
+        "main": workspace.main,
+        "files": workspace_file_summaries(&workspace),
         "url": workspace_url(state, request, id),
         "appUri": format!("{WORKSPACE_APP_URI_PREFIX}{id}")
     }))
@@ -5360,6 +5466,12 @@ fn supported_scad_dictionary() -> Value {
             "rands", "len", "concat", "str", "chr", "ord", "lookup", "search", "is_undef",
             "is_bool", "is_num", "is_string", "is_list", "is_function", "version", "version_num"
         ],
+        "files": {
+            "include": "include <name.scad> splices that file in place, variables and geometry included.",
+            "use": "use <name.scad> imports its modules and functions only. They keep seeing that file's own top-level variables; the caller does not, and use is not transitive.",
+            "resolution": "Names match workspace files exactly, then the bundled libraries. A workspace file shadows a bundled one of the same name.",
+            "bundledLibraries": ["units.scad", "shapes.scad", "MCAD/units.scad", "MCAD/shapes.scad"]
+        },
         "exportFormats": EXPORT_FORMATS,
         "notes": [
             "The dictionary describes implemented behavior, not full OpenSCAD parity.",
@@ -5881,7 +5993,7 @@ mod tests {
         let (store, root) = temporary_store();
         let created = store
             .create_with_settings(
-                "cube(1);".into(),
+                "cube(1);",
                 None,
                 Some("prusa-mk4s".into()),
                 Some(0.35),
@@ -7300,6 +7412,149 @@ mod tests {
             body: vec![],
         };
         assert!(allow_missing_workspace(&request));
+    }
+
+    fn mcp_test_request() -> Request {
+        Request {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn create_workspace_uploads_a_multi_file_project() {
+        let (state, root) = temporary_state(None);
+        let request = mcp_test_request();
+        let result = mcp_call_tool(
+            &state,
+            &request,
+            "create_workspace",
+            json!({"files": {
+                "main.scad": "include <params.scad>\nuse <parts.scad>\npeg();",
+                "params.scad": "height = 12;",
+                "parts.scad": "include <params.scad>\nmodule peg() cylinder(h=height, r=2);"
+            }}),
+        );
+        assert_eq!(result["isError"], json!(false), "{result}");
+        let workspace = &result["structuredContent"]["workspace"];
+        assert_eq!(workspace["main"], json!("main.scad"));
+        assert_eq!(workspace["files"].as_array().unwrap().len(), 3);
+        let objects = workspace["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1, "{objects:?}");
+        assert_eq!(objects[0]["bounds"]["max"][2], json!(12.0));
+
+        let id = workspace["id"].as_str().unwrap();
+        let listed = mcp_call_tool(
+            &state,
+            &request,
+            "list_workspace_objects",
+            json!({"workspaceId": id}),
+        );
+        assert_eq!(listed["structuredContent"]["main"], json!("main.scad"));
+        assert_eq!(
+            listed["structuredContent"]["files"][1],
+            json!({"name": "params.scad", "bytes": 12})
+        );
+        let link = mcp_call_tool(&state, &request, "get_workspace_link", json!({"workspaceId": id}));
+        assert_eq!(link["structuredContent"]["files"].as_array().unwrap().len(), 3);
+        let read = mcp_call_tool(
+            &state,
+            &request,
+            "get_workspace_code",
+            json!({"workspaceId": id, "path": "params.scad"}),
+        );
+        assert_eq!(read["structuredContent"]["code"], json!("height = 12;"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_workspace_checks_files_like_an_edit_does() {
+        let rejected = |input: Value| match initial_project(&input) {
+            Err(UpdateError::Invalid(message) | UpdateError::Validation(message)) => message,
+            other => panic!("{input} should be refused, got {other:?}"),
+        };
+        assert!(rejected(json!({"files": {"../x.scad": "cube(1);"}})).contains("valid file name"));
+        assert!(rejected(json!({"files": {}})).contains("at least one"));
+        assert!(rejected(json!({"files": {"a.scad": 1}})).contains("must be a string"));
+        assert!(rejected(json!({"code": "cube(1);", "files": {"a.scad": "cube(1);"}}))
+            .contains("not both"));
+        assert!(rejected(json!({"files": {"a.scad": "cube(1);", "b.scad": "cube(2);"}}))
+            .contains("`main`"));
+        assert!(rejected(json!({"files": {"a.scad": "cube(1);"}, "main": "b.scad"}))
+            .contains("b.scad"));
+        assert!(rejected(json!({"files": {"main.scad": "include <gone.scad>\ncube(1);"}}))
+            .contains("gone.scad"));
+        // A file nothing includes is still checked, as it would be on an edit.
+        assert!(rejected(json!({"files": {
+            "main.scad": "cube(1);",
+            "draft.scad": "y = \"open;"
+        }}))
+        .starts_with("draft.scad: "));
+        let too_many = (0..=MAX_FILES)
+            .map(|index| (format!("f{index}.scad"), json!("")))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(rejected(json!({"files": too_many, "main": "f0.scad"})).contains("at most"));
+
+        // The main file is inferred when it is unambiguous.
+        let one = initial_project(&json!({"files": {"box.scad": "cube(1);"}})).unwrap();
+        assert_eq!(one.main, "box.scad");
+        let named = initial_project(&json!({"files": {
+            "a.scad": "cube(1);",
+            "main.scad": "cube(2);"
+        }}))
+        .unwrap();
+        assert_eq!(named.main, "main.scad");
+        let chosen = initial_project(&json!({
+            "files": {"a.scad": "cube(1);", "b.scad": "cube(2);"},
+            "main": "b.scad"
+        }))
+        .unwrap();
+        assert_eq!(chosen.main, "b.scad");
+        // And plain `code` still makes a one-file workspace.
+        assert_eq!(
+            initial_project(&json!({"code": "cube(3);"})).unwrap(),
+            engine::Project::single("cube(3);")
+        );
+    }
+
+    #[test]
+    fn agent_facing_text_describes_multi_file_workspaces() {
+        for text in [MCP_INSTRUCTIONS.to_string(), supported_scad_dictionary().to_string()]
+            .into_iter()
+            .chain(mcp_tool_definitions().iter().map(Value::to_string))
+        {
+            for stale in ["single-file", "single file", "no user file system", "bundled library only"] {
+                assert!(!text.contains(stale), "{stale:?} survives in {text}");
+            }
+        }
+        assert!(MCP_INSTRUCTIONS.contains("include <name.scad>"));
+        // The limit is spelled out in plain strings; keep them honest.
+        assert!(MCP_INSTRUCTIONS.contains(&format!("up to {MAX_FILES} .scad files")));
+        let update = mcp_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "update_workspace_code")
+            .unwrap();
+        for property in ["path", "op", "to"] {
+            assert!(update["inputSchema"]["properties"].get(property).is_some());
+        }
+        assert!(update["description"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("at most {MAX_FILES} files")));
+        let create = mcp_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "create_workspace")
+            .unwrap();
+        for property in ["files", "main"] {
+            assert!(create["inputSchema"]["properties"].get(property).is_some());
+        }
+        assert!(supported_scad_dictionary()["files"]["use"]
+            .as_str()
+            .unwrap()
+            .contains("not transitive"));
     }
 
     #[test]

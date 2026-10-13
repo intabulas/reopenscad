@@ -35,9 +35,9 @@ use postgres::{Client, Config, Row};
 use serde_json::Value;
 
 use crate::{
-    default_main_file, default_workspace_name, plan_edit, sanitize_name, sanitize_plate,
-    sanitize_tolerance, single_file, unix_millis, valid_workspace_id, EditResult, UpdateError,
-    Workspace, WorkspaceUpdate, DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
+    default_workspace_name, plan_edit, sanitize_name, sanitize_plate, sanitize_tolerance,
+    unix_millis, valid_workspace_id, EditResult, UpdateError, Workspace, WorkspaceUpdate,
+    DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
 };
 
 /// Idle connections kept alive between requests. The server is thread-per-
@@ -387,21 +387,20 @@ impl PgWorkspaceStore {
 
     pub fn create_with_settings(
         &self,
-        code: String,
+        source: impl Into<crate::engine::Project>,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
     ) -> Result<Workspace, String> {
-        if code.len() > MAX_BODY {
+        let crate::engine::Project { main, files } = source.into();
+        if crate::total_source_bytes(&files) > MAX_BODY {
             return Err("Workspace code exceeds the 2 MiB limit.".into());
         }
         let now = unix_millis() as i64;
         let name = sanitize_name(name);
-        let main = default_main_file();
-        let files = single_file(code);
         let files_json =
             serde_json::to_value(&files).map_err(|error| format!("Workspace files: {error}"))?;
-        let code = files[&main].as_str();
+        let code = files.get(&main).map_or("", String::as_str);
         let plate = plate.as_deref().map(sanitize_plate).unwrap_or_default();
         let tolerance = tolerance.map(sanitize_tolerance).unwrap_or(DEFAULT_TOLERANCE);
         // Ids carry 112 bits of entropy, so a collision is theoretical; the
@@ -875,6 +874,8 @@ const MIGRATIONS: &[(i32, &[&str])] = &[(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::single_file;
+    use serde_json::json;
     use std::sync::mpsc;
 
     /// The Cloud Run connection string is a unix socket path, not a host:port,
@@ -929,7 +930,7 @@ mod tests {
     fn a_workspace_round_trips_through_the_database() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), Some("Test".into()), None, None)
+            .create_with_settings("cube(1);", Some("Test".into()), None, None)
             .unwrap();
         let loaded = store.get(&created.id).unwrap().expect("persisted");
         assert_eq!(loaded.main_code(), "cube(1);");
@@ -949,7 +950,7 @@ mod tests {
     fn concurrent_updates_on_one_base_revision_produce_one_winner() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         let base = created.revision;
 
@@ -1013,7 +1014,7 @@ mod tests {
     fn settings_writes_do_not_disturb_the_revision() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         let updated = store
             .update_settings(&created.id, Some("bambulab-x1c"), Some(0.35))
@@ -1035,7 +1036,7 @@ mod tests {
     fn a_code_save_does_not_roll_back_a_concurrent_settings_change() {
         let Some(store) = store() else { return };
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         // Stand in for the interleaving: the caller read revision 1 with an
         // empty plate, another tab set a plate, then the caller's edit lands.
@@ -1169,7 +1170,7 @@ mod tests {
         let Some(database) = legacy_database() else { return };
         let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         store
             .update(
@@ -1199,7 +1200,6 @@ mod tests {
         assert_eq!(code, "cube(4);");
     }
 
-    use serde_json::json;
 
     fn patch(
         store: &PgWorkspaceStore,
@@ -1219,7 +1219,7 @@ mod tests {
         let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
         let mut old = connect(&database.config).unwrap();
         let created = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         let step = patch(
             &store,
@@ -1310,7 +1310,7 @@ mod tests {
     fn the_event_log_stays_bounded() {
         let Some(store) = store() else { return };
         let mut workspace = store
-            .create_with_settings("cube(1);".into(), None, None, None)
+            .create_with_settings("cube(1);", None, None, None)
             .unwrap();
         for index in 0..(MAX_EVENTS + 5) {
             workspace = store

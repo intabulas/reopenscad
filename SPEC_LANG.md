@@ -442,6 +442,12 @@ Search paths: relative to the current file, then the library path(s). `<>` is
 the literal syntax (not optional). A web implementation should map this to its
 own virtual file system / project storage.
 
+ReOpenSCAD maps it to the workspace's files. They form a flat namespace, so a
+name is matched exactly against the workspace's file names, then against the
+bundled `units.scad` and `shapes.scad` (also as `MCAD/…`). A `use`d file's
+modules and functions keep seeing that file's own top-level variables, and
+`use` is not transitive.
+
 ## 18. Customizer parameter annotations
 
 Structured comments turn top-level assignments into UI controls (needed for
