@@ -1216,9 +1216,12 @@ function finalAiUpdate(payload, workspace) {
   if (!Array.isArray(events) || !events.length) return { isAi: false, ranges: [] };
   const finalEvent = events.reduce((latest, event) => Number(event.revision) >= Number(latest.revision) ? event : latest);
   if (finalEvent.source !== 'ai') return { isAi: false, ranges: [] };
+  // The editor shows the main file, so only edits to it have ranges worth highlighting.
+  // Events logged before workspaces had files carry no path and were all main-file edits.
+  const inEditor = (event) => !event.path || event.path === workspace.main;
   return {
     isAi: true,
-    ranges: events.filter((event) => event.source === 'ai' && Number(event.revision) === Number(finalEvent.revision)),
+    ranges: events.filter((event) => event.source === 'ai' && Number(event.revision) === Number(finalEvent.revision) && inEditor(event)),
   };
 }
 
@@ -1267,6 +1270,14 @@ function applyWorkspace(payload, { remote = false, force = false } = {}) {
   }
   const incomingRevision = Number(workspace.revision);
   let shouldRenderAiUpdate = false;
+  // A remote change that left the main file as last saved (another file was edited) is not
+  // a conflict with unsaved typing: take the new revision and keep the editor as it is.
+  // Reported as not applied, so the caller does not mark the still-unsaved editor Synced.
+  if (remote && !force && typeof workspace.code === 'string' && workspace.code === workspaceSavedCode && hasPendingLocalWorkspaceChanges()) {
+    if (Number.isFinite(incomingRevision)) workspaceRevision = incomingRevision;
+    storeLocalWorkspace();
+    return false;
+  }
   if (remote && !force && typeof workspace.code === 'string' && workspace.code !== editor.value && hasPendingLocalWorkspaceChanges()) {
     surfaceWorkspaceConflict(payload);
     return false;

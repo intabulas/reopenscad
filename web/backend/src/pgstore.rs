@@ -35,10 +35,9 @@ use postgres::{Client, Config, Row};
 use serde_json::Value;
 
 use crate::{
-    default_main_file, default_workspace_name, normalize_source, plan_edit, sanitize_name,
-    sanitize_plate, sanitize_tolerance, single_file, unix_millis, valid_workspace_id, EditResult,
-    PlannedEdit, UpdateError, Workspace, WorkspaceEvent, WorkspaceUpdate, DEFAULT_TOLERANCE,
-    MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
+    default_main_file, default_workspace_name, plan_edit, sanitize_name, sanitize_plate,
+    sanitize_tolerance, single_file, unix_millis, valid_workspace_id, EditResult, UpdateError,
+    Workspace, WorkspaceUpdate, DEFAULT_TOLERANCE, MAX_BODY, MAX_EVENTS, MAX_WORKSPACES,
 };
 
 /// Idle connections kept alive between requests. The server is thread-per-
@@ -487,27 +486,17 @@ impl PgWorkspaceStore {
         if expected != current.revision {
             return Err(UpdateError::Conflict(Box::new(current)));
         }
-        let PlannedEdit {
-            files,
-            start,
-            end,
-            inserted_length,
-        } = plan_edit(&current, &mut update)?;
-        let files_json = serde_json::to_value(&files)
+        let planned = plan_edit(&current, &mut update)?;
+        let files_json = serde_json::to_value(&planned.files)
             .map_err(|error| UpdateError::Internal(error.to_string()))?;
         // The legacy `code` column follows the main file; see migration 4.
-        let code = files.get(&current.main).map_or("", String::as_str);
+        let code = planned
+            .files
+            .get(&planned.main)
+            .map_or("", String::as_str);
 
         let now = unix_millis();
-        let event = WorkspaceEvent {
-            workspace_id: id.to_string(),
-            revision: current.revision + 1,
-            source: normalize_source(&update.source),
-            start,
-            end,
-            inserted_length,
-            timestamp: now,
-        };
+        let event = planned.event(id, current.revision + 1, &update.source, now);
         // Fields the caller did not mention are passed as NULL and resolved by
         // `COALESCE` against the *current* column value, not against the copy
         // this thread read a moment ago. That matters because settings writes
@@ -537,6 +526,7 @@ impl PgWorkspaceStore {
                         "UPDATE workspaces SET
                              code = $1,
                              files = $10,
+                             main = $11,
                              name = COALESCE($2, name),
                              plate = COALESCE($3, plate),
                              tolerance = COALESCE($4, tolerance),
@@ -558,6 +548,7 @@ impl PgWorkspaceStore {
                         &owned,
                         &expected_i64,
                         &files_json,
+                        &planned.main,
                     ],
                 )
             })
@@ -976,6 +967,9 @@ mod tests {
                 store.update(
                     &id,
                     WorkspaceUpdate {
+                        path: None,
+                        op: crate::FileOp::Edit,
+                        to: None,
                         code: Some(code.to_string()),
                         name: None,
                         start: None,
@@ -1052,6 +1046,9 @@ mod tests {
             .update(
                 &created.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: crate::FileOp::Edit,
+                    to: None,
                     code: Some("cube(2);".into()),
                     name: None,
                     start: None,
@@ -1178,6 +1175,9 @@ mod tests {
             .update(
                 &created.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: crate::FileOp::Edit,
+                    to: None,
                     code: Some("cube(4);".into()),
                     name: None,
                     start: None,
@@ -1199,6 +1199,111 @@ mod tests {
         assert_eq!(code, "cube(4);");
     }
 
+    use serde_json::json;
+
+    fn patch(
+        store: &PgWorkspaceStore,
+        id: &str,
+        revision: u64,
+        mut body: Value,
+    ) -> Result<EditResult, UpdateError> {
+        body["baseRevision"] = json!(revision);
+        store.update(id, serde_json::from_value(body).unwrap())
+    }
+
+    /// Every file operation goes through the same compare-and-swap, and the
+    /// `main` and `code` columns follow a renamed or switched main file.
+    #[test]
+    fn file_operations_round_trip_through_the_database() {
+        let Some(database) = legacy_database() else { return };
+        let store = PgWorkspaceStore::open_config(database.config.clone()).unwrap();
+        let mut old = connect(&database.config).unwrap();
+        let created = store
+            .create_with_settings("cube(1);".into(), None, None, None)
+            .unwrap();
+        let step = patch(
+            &store,
+            &created.id,
+            1,
+            json!({"path": "params.scad", "code": "size = 3;"}),
+        )
+        .unwrap();
+        let step = patch(
+            &store,
+            &created.id,
+            step.workspace.revision,
+            json!({"code": "include <params.scad>\ncube(size);"}),
+        )
+        .unwrap();
+        let step = patch(
+            &store,
+            &created.id,
+            step.workspace.revision,
+            json!({"op": "rename", "path": "main.scad", "to": "box.scad"}),
+        )
+        .unwrap();
+        assert_eq!(step.workspace.main, "box.scad");
+        let reloaded = store.get(&created.id).unwrap().unwrap();
+        assert_eq!(reloaded.main, "box.scad");
+        assert_eq!(
+            reloaded.files.keys().collect::<Vec<_>>(),
+            ["box.scad", "params.scad"]
+        );
+        let code: String = old
+            .query_one("SELECT code FROM workspaces WHERE id = $1", &[&created.id])
+            .unwrap()
+            .get(0);
+        assert_eq!(code, "include <params.scad>\ncube(size);");
+
+        // An older build only knows `code`; its write lands in the main file
+        // and nowhere else.
+        old.execute(
+            LEGACY_UPDATE,
+            &[&"include <params.scad>\nsphere(size);", &created.id],
+        )
+        .unwrap();
+        let after_old = store.get(&created.id).unwrap().unwrap();
+        assert_eq!(after_old.main_code(), "include <params.scad>\nsphere(size);");
+        assert_eq!(after_old.files["params.scad"], "size = 3;");
+
+        let step = patch(
+            &store,
+            &created.id,
+            after_old.revision,
+            json!({"op": "setMain", "path": "params.scad"}),
+        );
+        // params.scad on its own evaluates fine but draws nothing; validation
+        // accepts definition-only files.
+        let step = step.unwrap();
+        assert_eq!(step.workspace.main, "params.scad");
+        // `files` is unchanged by a setMain, so this is the trigger's no-op
+        // path: `code` must still follow the new main file.
+        let code: String = old
+            .query_one("SELECT code FROM workspaces WHERE id = $1", &[&created.id])
+            .unwrap()
+            .get(0);
+        assert_eq!(code, "size = 3;");
+        let stale = patch(
+            &store,
+            &created.id,
+            after_old.revision,
+            json!({"op": "delete", "path": "box.scad"}),
+        );
+        assert!(matches!(stale, Err(UpdateError::Conflict(_))), "{stale:?}");
+        let deleted = patch(
+            &store,
+            &created.id,
+            step.workspace.revision,
+            json!({"op": "delete", "path": "box.scad"}),
+        )
+        .unwrap();
+        assert_eq!(
+            deleted.workspace.files.keys().collect::<Vec<_>>(),
+            ["params.scad"]
+        );
+        assert_eq!(deleted.workspace.events.last().unwrap().path, "box.scad");
+    }
+
     /// The event log is bounded in SQL, not by a read-modify-write in the
     /// process, so it stays capped no matter which instance did the writing.
     #[test]
@@ -1212,6 +1317,9 @@ mod tests {
                 .update(
                     &workspace.id,
                     WorkspaceUpdate {
+                        path: None,
+                        op: crate::FileOp::Edit,
+                        to: None,
                         code: Some(format!("cube({});", index + 1)),
                         name: None,
                         start: None,

@@ -39,6 +39,10 @@ const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 /// deadline constants the browser cross-checks stay stable.
 const MAX_CONCURRENT_JOBS: usize = 2;
 const MAX_EVENTS: usize = 64;
+/// Files one workspace may hold, the main one included.
+const MAX_FILES: usize = 32;
+/// Longest accepted file name, `.scad` included.
+const MAX_FILE_NAME: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Denial-of-service guard rails.
@@ -285,15 +289,57 @@ struct WorkspaceEvent {
     workspace_id: String,
     revision: u64,
     source: String,
+    /// The file the event happened to. Empty on events logged before
+    /// workspaces had files, all of which were edits to the main file.
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    kind: EventKind,
+    /// The new name, on a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    /// The replaced byte range of `path` and the length of its replacement.
+    /// Zero for everything but an edit.
     start: usize,
     end: usize,
     inserted_length: usize,
     timestamp: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum EventKind {
+    #[default]
+    Edit,
+    Create,
+    Delete,
+    Rename,
+    SetMain,
+}
+
+/// What a PATCH does to its `path`. Absent means an edit, which is also how a
+/// file is created: replacing the `code` of a name that does not exist yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum FileOp {
+    #[default]
+    Edit,
+    Delete,
+    Rename,
+    SetMain,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceUpdate {
+    /// The file to act on; the main file when absent.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    op: FileOp,
+    /// The new name, for a rename.
+    #[serde(default)]
+    to: Option<String>,
     code: Option<String>,
     name: Option<String>,
     start: Option<usize>,
@@ -364,62 +410,203 @@ fn total_source_bytes(files: &BTreeMap<String, String>) -> usize {
     files.values().map(String::len).sum()
 }
 
-/// What an accepted edit turns the workspace's files into, and the event
-/// fields describing it. Shared by both stores so they cannot disagree on
-/// what an edit means.
+/// What an accepted edit turns the workspace into, and the event fields
+/// describing it. Shared by both stores so they cannot disagree on what an
+/// edit means.
 struct PlannedEdit {
+    main: String,
     files: BTreeMap<String, String>,
+    path: String,
+    kind: EventKind,
+    to: Option<String>,
     start: usize,
     end: usize,
     inserted_length: usize,
 }
 
-/// Applies `update`'s replacement or splice to the main file and validates
-/// the result as a whole project, since an edit to one file can break a file
-/// that includes it.
+/// Whether `name` may name a workspace file: a plain `.scad` file name, with
+/// no directory and nothing a path could be built from.
+impl PlannedEdit {
+    fn event(&self, workspace_id: &str, revision: u64, source: &str, now: u64) -> WorkspaceEvent {
+        WorkspaceEvent {
+            workspace_id: workspace_id.to_string(),
+            revision,
+            source: normalize_source(source),
+            path: self.path.clone(),
+            kind: self.kind,
+            to: self.to.clone(),
+            start: self.start,
+            end: self.end,
+            inserted_length: self.inserted_length,
+            timestamp: now,
+        }
+    }
+}
+
+fn valid_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".scad") else {
+        return false;
+    };
+    name.len() <= MAX_FILE_NAME
+        && stem
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !stem.contains("..")
+}
+
+fn file_name_error(name: &str) -> UpdateError {
+    UpdateError::Invalid(format!(
+        "{name:?} is not a valid file name. Use letters, digits, '_', '-' and '.', start with \
+         a letter or digit, end in .scad, and keep it to {MAX_FILE_NAME} characters."
+    ))
+}
+
+fn missing_file_error(name: &str) -> UpdateError {
+    UpdateError::Invalid(format!("No file named {name:?} in this workspace."))
+}
+
+/// Applies `update` to `current` and validates the result as a whole
+/// project, since a change to one file can break a file that includes it.
+///
+/// The main file must still validate afterwards, and a file that was edited
+/// or created must also validate on its own, so a syntax error in a file
+/// nothing includes yet is still caught when it is saved.
 fn plan_edit(
     current: &Workspace,
     update: &mut WorkspaceUpdate,
 ) -> Result<PlannedEdit, UpdateError> {
-    let existing = current.main_code();
-    let (code, start, end, inserted_length) = if let Some(code) = update.code.take() {
-        let new_len = code.len();
-        (code, 0, existing.len(), new_len)
-    } else {
-        let start = update.start.ok_or_else(|| {
-            UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-        })?;
-        let end = update.end.ok_or_else(|| {
-            UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-        })?;
-        let text = update.text.take().unwrap_or_default();
-        if start > end
-            || end > existing.len()
-            || !existing.is_char_boundary(start)
-            || !existing.is_char_boundary(end)
-        {
-            return Err(UpdateError::Invalid(
-                "Edit range must use valid UTF-8 byte offsets within the document.".into(),
-            ));
-        }
-        let mut code = existing.to_string();
-        code.replace_range(start..end, &text);
-        (code, start, end, text.len())
-    };
+    let path = update.path.take().unwrap_or_else(|| current.main.clone());
+    let mut main = current.main.clone();
     let mut files = current.files.clone();
-    files.insert(current.main.clone(), code);
+    let mut to = None;
+    let (kind, start, end, inserted_length) = match update.op {
+        FileOp::Edit => {
+            let existing = files.get(&path);
+            let (code, start, end, inserted_length) = if let Some(code) = update.code.take() {
+                let old_len = existing.map_or(0, String::len);
+                let new_len = code.len();
+                (code, 0, old_len, new_len)
+            } else {
+                let existing = existing.ok_or_else(|| {
+                    UpdateError::Invalid(format!(
+                        "No file named {path:?} in this workspace. Send `code` to create it."
+                    ))
+                })?;
+                let start = update.start.ok_or_else(|| {
+                    UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+                })?;
+                let end = update.end.ok_or_else(|| {
+                    UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+                })?;
+                let text = update.text.take().unwrap_or_default();
+                if start > end
+                    || end > existing.len()
+                    || !existing.is_char_boundary(start)
+                    || !existing.is_char_boundary(end)
+                {
+                    return Err(UpdateError::Invalid(
+                        "Edit range must use valid UTF-8 byte offsets within the document."
+                            .into(),
+                    ));
+                }
+                let mut code = existing.clone();
+                code.replace_range(start..end, &text);
+                (code, start, end, text.len())
+            };
+            let kind = if files.contains_key(&path) {
+                EventKind::Edit
+            } else {
+                if !valid_file_name(&path) {
+                    return Err(file_name_error(&path));
+                }
+                if files.len() >= MAX_FILES {
+                    return Err(UpdateError::Invalid(format!(
+                        "A workspace holds at most {MAX_FILES} files."
+                    )));
+                }
+                EventKind::Create
+            };
+            files.insert(path.clone(), code);
+            (kind, start, end, inserted_length)
+        }
+        op => {
+            if update.code.is_some()
+                || update.start.is_some()
+                || update.end.is_some()
+                || update.text.is_some()
+            {
+                return Err(UpdateError::Invalid(
+                    "A delete, rename or setMain carries no code or range.".into(),
+                ));
+            }
+            if !files.contains_key(&path) {
+                return Err(missing_file_error(&path));
+            }
+            match op {
+                FileOp::Delete => {
+                    if path == main {
+                        return Err(UpdateError::Invalid(
+                            "The main file cannot be deleted; make another file main first."
+                                .into(),
+                        ));
+                    }
+                    let removed = files.remove(&path).unwrap_or_default();
+                    (EventKind::Delete, 0, removed.len(), 0)
+                }
+                FileOp::Rename => {
+                    let target = update.to.take().ok_or_else(|| {
+                        UpdateError::Invalid("A rename needs `to`, the new name.".into())
+                    })?;
+                    if !valid_file_name(&target) {
+                        return Err(file_name_error(&target));
+                    }
+                    if files.contains_key(&target) {
+                        return Err(UpdateError::Invalid(format!(
+                            "A file named {target:?} already exists."
+                        )));
+                    }
+                    let source = files.remove(&path).unwrap_or_default();
+                    files.insert(target.clone(), source);
+                    if path == main {
+                        main = target.clone();
+                    }
+                    to = Some(target);
+                    (EventKind::Rename, 0, 0, 0)
+                }
+                FileOp::SetMain => {
+                    main = path.clone();
+                    (EventKind::SetMain, 0, 0, 0)
+                }
+                FileOp::Edit => unreachable!("handled above"),
+            }
+        }
+    };
     if total_source_bytes(&files) > MAX_BODY {
         return Err(UpdateError::Invalid(
             "Workspace code exceeds the 2 MiB limit.".into(),
         ));
     }
-    validate_source(engine::Project {
-        main: current.main.clone(),
-        files: files.clone(),
-    })
-    .map_err(UpdateError::Validation)?;
-    Ok(PlannedEdit {
+    let mut project = engine::Project {
+        main: main.clone(),
         files,
+    };
+    validate_source(&project).map_err(UpdateError::Validation)?;
+    if matches!(kind, EventKind::Edit | EventKind::Create) && path != main {
+        project.main = path.clone();
+        validate_source(&project)
+            .map_err(|error| UpdateError::Validation(format!("{path}: {error}")))?;
+        project.main = main.clone();
+    }
+    Ok(PlannedEdit {
+        main,
+        files: project.files,
+        path,
+        kind,
+        to,
         start,
         end,
         inserted_length,
@@ -771,12 +958,7 @@ impl WorkspaceStore {
         if expected != current.revision {
             return Err(UpdateError::Conflict(Box::new(current)));
         }
-        let PlannedEdit {
-            files,
-            start,
-            end,
-            inserted_length,
-        } = plan_edit(&current, &mut update)?;
+        let planned = plan_edit(&current, &mut update)?;
         let mut inner = self
             .inner
             .lock()
@@ -789,17 +971,10 @@ impl WorkspaceStore {
             return Err(UpdateError::Conflict(Box::new(latest)));
         }
         let now = unix_millis();
-        let event = WorkspaceEvent {
-            workspace_id: id.to_string(),
-            revision: current.revision + 1,
-            source: normalize_source(&update.source),
-            start,
-            end,
-            inserted_length,
-            timestamp: now,
-        };
+        let event = planned.event(id, current.revision + 1, &update.source, now);
         let mut workspace = latest;
-        workspace.files = files;
+        workspace.main = planned.main;
+        workspace.files = planned.files;
         if let Some(name) = update.name {
             workspace.name = sanitize_name(Some(name));
         }
@@ -3003,6 +3178,9 @@ fn handle_update_workspace(
         && update.start.is_none()
         && update.end.is_none()
         && update.text.is_none()
+        && update.path.is_none()
+        && update.op == FileOp::Edit
+        && update.to.is_none()
         && (update.plate.is_some() || update.tolerance.is_some())
     {
         return match state
@@ -3061,9 +3239,10 @@ fn handle_query_workspace_code(
         Err(error) => return respond_error(stream, 500, &error),
     };
     let parameters = query_parameters(&request.query);
-    let start = query_usize(&parameters, "start").unwrap_or(0);
-    let end = query_usize(&parameters, "end").unwrap_or(workspace.main_code().len());
-    match workspace_code_slice(&workspace, start, end) {
+    let path = parameters.get("path").map(String::as_str);
+    let start = query_usize(&parameters, "start");
+    let end = query_usize(&parameters, "end");
+    match workspace_code_slice(&workspace, path, start, end) {
         Ok(payload) => respond_value(stream, 200, &payload),
         Err(error) => respond_error(stream, 400, &error),
     }
@@ -3218,11 +3397,24 @@ fn is_safe_preview_data_url(value: &str) -> bool {
 /// The partial-read payload shared by `GET /api/workspaces/{id}/code` and the
 /// `get_workspace_code` MCP tool, so the two can never disagree about which
 /// byte ranges are legal or what a slice reply looks like.
-fn workspace_code_slice(workspace: &Workspace, start: usize, end: usize) -> Result<Value, String> {
+/// A byte range of one file, the main one unless `path` names another.
+fn workspace_code_slice(
+    workspace: &Workspace,
+    path: Option<&str>,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<Value, String> {
+    let path = path.unwrap_or(&workspace.main);
+    let source = workspace
+        .files
+        .get(path)
+        .ok_or_else(|| format!("No file named {path:?} in this workspace."))?;
+    let start = start.unwrap_or(0);
+    let end = end.unwrap_or(source.len());
     if start > end
-        || end > workspace.main_code().len()
-        || !workspace.main_code().is_char_boundary(start)
-        || !workspace.main_code().is_char_boundary(end)
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
     {
         return Err("Range must use valid UTF-8 byte offsets within the document.".into());
     }
@@ -3230,11 +3422,23 @@ fn workspace_code_slice(workspace: &Workspace, start: usize, end: usize) -> Resu
         "ok": true,
         "workspaceId": workspace.id,
         "revision": workspace.revision,
+        "path": path,
+        "main": workspace.main,
         "start": start,
         "end": end,
-        "totalLength": workspace.main_code().len(),
-        "code": &workspace.main_code()[start..end]
+        "totalLength": source.len(),
+        "code": &source[start..end]
     }))
+}
+
+/// The workspace's files by name and size, without their contents, which
+/// `code` (the main file) and the ranged reader serve.
+fn workspace_file_summaries(workspace: &Workspace) -> Vec<Value> {
+    workspace
+        .files
+        .iter()
+        .map(|(name, source)| json!({"name": name, "bytes": source.len()}))
+        .collect()
 }
 
 fn handle_workspace_events(
@@ -3317,6 +3521,8 @@ fn workspace_events_payload(id: &str, workspace: &Workspace, since: u64) -> Valu
     });
     if changed {
         payload["code"] = json!(workspace.main_code());
+        payload["main"] = json!(workspace.main);
+        payload["files"] = json!(workspace_file_summaries(workspace));
     }
     payload
 }
@@ -3914,6 +4120,8 @@ fn workspace_public(
         "id": workspace.id,
         "name": workspace.name,
         "code": workspace.main_code(),
+        "main": workspace.main,
+        "files": workspace_file_summaries(workspace),
         "revision": workspace.revision,
         "createdAt": workspace.created_at,
         "updatedAt": workspace.updated_at,
@@ -4691,6 +4899,7 @@ fn mcp_tool_definitions() -> Vec<Value> {
                 "required": ["workspaceId"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string"},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0}
                 }
@@ -4704,6 +4913,9 @@ fn mcp_tool_definitions() -> Vec<Value> {
                 "required": ["workspaceId", "expectedRevision"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string"},
+                    "op": {"type": "string", "enum": ["edit", "delete", "rename", "setMain"]},
+                    "to": {"type": "string"},
                     "code": {"type": "string"},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0},
@@ -4909,12 +5121,16 @@ fn mcp_get_workspace_code(state: &AppState, arguments: &Value) -> Result<Value, 
         .workspaces
         .get(id)?
         .ok_or_else(|| "Workspace not found.".to_string())?;
-    let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let path = arguments.get("path").and_then(Value::as_str);
+    let start = arguments
+        .get("start")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
     let end = arguments
         .get("end")
         .and_then(Value::as_u64)
-        .unwrap_or(workspace.main_code().len() as u64) as usize;
-    workspace_code_slice(&workspace, start, end)
+        .map(|value| value as usize);
+    workspace_code_slice(&workspace, path, start, end)
 }
 
 fn mcp_update_workspace(
@@ -5686,6 +5902,9 @@ mod tests {
             .update(
                 &created.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: Some("cube(2);".into()),
                     name: None,
                     start: None,
@@ -6201,6 +6420,9 @@ mod tests {
             .update(
                 &workspace.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: None,
                     name: None,
                     start: Some(5),
@@ -6222,6 +6444,9 @@ mod tests {
             store.update(
                 &workspace.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: Some("sphere(3);".into()),
                     name: None,
                     start: None,
@@ -6251,6 +6476,9 @@ mod tests {
 
     fn replace_code(code: &str, revision: u64) -> WorkspaceUpdate {
         WorkspaceUpdate {
+            path: None,
+            op: FileOp::Edit,
+            to: None,
             code: Some(code.into()),
             name: None,
             start: None,
@@ -6338,6 +6566,338 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Applies a PATCH body exactly as a client would send it.
+    fn patch(
+        store: &WorkspaceStore,
+        id: &str,
+        revision: u64,
+        mut body: Value,
+    ) -> Result<EditResult, UpdateError> {
+        body["baseRevision"] = json!(revision);
+        store.update(id, serde_json::from_value(body).unwrap())
+    }
+
+    fn multi_file_workspace() -> (WorkspaceStore, PathBuf, Workspace) {
+        let (store, root) = temporary_store();
+        // Grown through the API, as a client would: the include can only
+        // validate once params.scad exists.
+        let created = store.create("cube(1);".into(), None).unwrap();
+        let workspace = patch(
+            &store,
+            &created.id,
+            created.revision,
+            json!({"path": "params.scad", "code": "size = 3;"}),
+        )
+        .unwrap()
+        .workspace;
+        let workspace = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"code": "include <params.scad>\ncube(size);"}),
+        )
+        .unwrap()
+        .workspace;
+        (store, root, workspace)
+    }
+
+    #[test]
+    fn editing_a_new_path_creates_the_file() {
+        let (_store, root, workspace) = multi_file_workspace();
+        assert_eq!(workspace.files.len(), 2);
+        assert_eq!(workspace.files["params.scad"], "size = 3;");
+        let created = &workspace.events[workspace.events.len() - 2];
+        assert_eq!(created.kind, EventKind::Create);
+        assert_eq!(created.path, "params.scad");
+        assert_eq!(workspace.events.last().unwrap().path, "main.scad");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_range_edit_reaches_a_non_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let result = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "params.scad", "start": 7, "end": 8, "text": "12"}),
+        )
+        .unwrap();
+        assert_eq!(result.workspace.files["params.scad"], "size = 12;");
+        assert_eq!(result.event.kind, EventKind::Edit);
+        assert_eq!(
+            (result.event.start, result.event.end, result.event.inserted_length),
+            (7, 8, 2)
+        );
+        let missing = patch(
+            &store,
+            &workspace.id,
+            result.workspace.revision,
+            json!({"path": "nope.scad", "start": 0, "end": 0, "text": "x"}),
+        );
+        assert!(
+            matches!(&missing, Err(UpdateError::Invalid(message)) if message.contains("Send `code`")),
+            "{missing:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_names_are_plain_scad_names() {
+        for name in [
+            "parts.scad",
+            "parts-v2.scad",
+            "lib.v1.scad",
+            "2_hinge.scad",
+            "MCAD.scad",
+        ] {
+            assert!(valid_file_name(name), "{name} should be accepted");
+        }
+        let long = format!("{}.scad", "a".repeat(MAX_FILE_NAME));
+        for name in [
+            "",
+            ".scad",
+            "parts",
+            "parts.txt",
+            "../parts.scad",
+            "dir/parts.scad",
+            "dir\\parts.scad",
+            ".hidden.scad",
+            "-dash.scad",
+            "a..b.scad",
+            "space name.scad",
+            "ünï.scad",
+            long.as_str(),
+        ] {
+            assert!(!valid_file_name(name), "{name:?} should be rejected");
+        }
+        let (store, root, workspace) = multi_file_workspace();
+        let rejected = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "../escape.scad", "code": "x = 1;"}),
+        );
+        assert!(
+            matches!(&rejected, Err(UpdateError::Invalid(message)) if message.contains("not a valid file name")),
+            "{rejected:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_holds_a_bounded_number_of_files() {
+        let (store, root, mut workspace) = multi_file_workspace();
+        while workspace.files.len() < MAX_FILES {
+            let name = format!("f{}.scad", workspace.files.len());
+            workspace = patch(
+                &store,
+                &workspace.id,
+                workspace.revision,
+                json!({"path": name, "code": ""}),
+            )
+            .unwrap()
+            .workspace;
+        }
+        let over = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "one-too-many.scad", "code": ""}),
+        );
+        assert!(
+            matches!(&over, Err(UpdateError::Invalid(message)) if message.contains("at most")),
+            "{over:?}"
+        );
+        // Editing an existing file is still fine at the cap.
+        patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "f2.scad", "code": "y = 1;"}),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_file_is_validated_and_spares_the_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let breaks_include = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "delete", "path": "params.scad"}),
+        );
+        assert!(
+            matches!(&breaks_include, Err(UpdateError::Validation(message)) if message.contains("params.scad")),
+            "{breaks_include:?}"
+        );
+        let main = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "delete", "path": "main.scad"}),
+        );
+        assert!(matches!(main, Err(UpdateError::Invalid(_))), "{main:?}");
+        let unused = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "unused.scad", "code": "z = 1;"}),
+        )
+        .unwrap()
+        .workspace;
+        let deleted = patch(
+            &store,
+            &workspace.id,
+            unused.revision,
+            json!({"op": "delete", "path": "unused.scad"}),
+        )
+        .unwrap();
+        assert!(!deleted.workspace.files.contains_key("unused.scad"));
+        assert_eq!(deleted.event.kind, EventKind::Delete);
+        assert_eq!(deleted.event.path, "unused.scad");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renaming_moves_the_file_and_follows_the_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let breaks_include = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "params.scad", "to": "sizes.scad"}),
+        );
+        assert!(
+            matches!(breaks_include, Err(UpdateError::Validation(_))),
+            "{breaks_include:?}"
+        );
+        let taken = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "main.scad", "to": "params.scad"}),
+        );
+        assert!(
+            matches!(&taken, Err(UpdateError::Invalid(message)) if message.contains("already exists")),
+            "{taken:?}"
+        );
+        let renamed = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "main.scad", "to": "box.scad"}),
+        )
+        .unwrap();
+        assert_eq!(renamed.workspace.main, "box.scad");
+        assert_eq!(
+            renamed.workspace.main_code(),
+            "include <params.scad>\ncube(size);"
+        );
+        assert!(!renamed.workspace.files.contains_key("main.scad"));
+        assert_eq!(renamed.event.kind, EventKind::Rename);
+        assert_eq!(renamed.event.to.as_deref(), Some("box.scad"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_main_changes_which_file_renders() {
+        let (store, root, workspace) = multi_file_workspace();
+        let lib = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "other.scad", "code": "sphere(2);"}),
+        )
+        .unwrap()
+        .workspace;
+        let switched = patch(
+            &store,
+            &workspace.id,
+            lib.revision,
+            json!({"op": "setMain", "path": "other.scad"}),
+        )
+        .unwrap();
+        assert_eq!(switched.workspace.main, "other.scad");
+        assert_eq!(switched.workspace.main_code(), "sphere(2);");
+        assert_eq!(switched.event.kind, EventKind::SetMain);
+        let missing = patch(
+            &store,
+            &workspace.id,
+            switched.workspace.revision,
+            json!({"op": "setMain", "path": "nope.scad"}),
+        );
+        assert!(matches!(missing, Err(UpdateError::Invalid(_))), "{missing:?}");
+        let with_code = patch(
+            &store,
+            &workspace.id,
+            switched.workspace.revision,
+            json!({"op": "setMain", "path": "main.scad", "code": "cube(1);"}),
+        );
+        assert!(matches!(with_code, Err(UpdateError::Invalid(_))), "{with_code:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_file_is_rejected_even_when_nothing_includes_it() {
+        let (store, root, workspace) = multi_file_workspace();
+        let broken = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "draft.scad", "code": "y = \"open;"}),
+        );
+        assert!(
+            matches!(&broken, Err(UpdateError::Validation(message)) if message.starts_with("draft.scad: ")),
+            "{broken:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payloads_list_files_and_the_reader_takes_a_path() {
+        let (store, root, workspace) = multi_file_workspace();
+        let events = workspace_events_payload(&workspace.id, &workspace, 0);
+        assert_eq!(events["main"], json!("main.scad"));
+        assert_eq!(
+            events["files"],
+            json!([
+                {"name": "main.scad", "bytes": workspace.main_code().len()},
+                {"name": "params.scad", "bytes": 9}
+            ])
+        );
+        let ranges = events["updatedRanges"].as_array().unwrap();
+        assert!(ranges.iter().any(|event| event["kind"] == "create"
+            && event["path"] == "params.scad"));
+        let slice = workspace_code_slice(&workspace, Some("params.scad"), Some(0), Some(4)).unwrap();
+        assert_eq!(slice["code"], json!("size"));
+        assert_eq!(slice["totalLength"], json!(9));
+        let main = workspace_code_slice(&workspace, None, None, None).unwrap();
+        assert_eq!(main["path"], json!("main.scad"));
+        assert!(workspace_code_slice(&workspace, Some("nope.scad"), None, None).is_err());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn events_logged_before_files_read_as_main_file_edits() {
+        let event: WorkspaceEvent = serde_json::from_value(json!({
+            "workspaceId": "x",
+            "revision": 2,
+            "source": "ai",
+            "start": 0,
+            "end": 1,
+            "insertedLength": 3,
+            "timestamp": 0
+        }))
+        .unwrap();
+        assert_eq!(event.kind, EventKind::Edit);
+        assert_eq!(event.path, "");
+        assert!(serde_json::to_value(&event).unwrap().get("to").is_none());
+    }
+
     #[test]
     fn every_update_requires_an_optimistic_revision_token() {
         let (store, root) = temporary_store();
@@ -6345,6 +6905,9 @@ mod tests {
         let result = store.update(
             &workspace.id,
             WorkspaceUpdate {
+                path: None,
+                op: FileOp::Edit,
+                to: None,
                 code: Some("cube(2);".into()),
                 name: None,
                 start: None,
@@ -6371,6 +6934,9 @@ mod tests {
         let result = store.update(
             &workspace.id,
             WorkspaceUpdate {
+                path: None,
+                op: FileOp::Edit,
+                to: None,
                 code: Some("cube(;".into()),
                 name: None,
                 start: None,
