@@ -82,7 +82,7 @@ button { color: inherit; }
 .workspace { min-height: 0; display: grid; grid-template-columns: var(--objects-width) minmax(280px, var(--editor-share)) 4px minmax(320px, 1fr) auto; grid-template-rows: minmax(200px, 1fr) var(--console-height); overflow: hidden; }
 .editor-pane, .viewer-pane, .customizer, .console-pane { min-width: 0; min-height: 0; background: var(--panel); }
 .objects-pane { grid-column: 1; grid-row: 1 / 3; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(96px, 1fr) auto; background: #12171c; border-right: 1px solid #090c0f; box-shadow: 1px 0 #29313a inset; }
-.editor-pane { grid-column: 2; grid-row: 1; }
+.editor-pane { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; }
 .viewer-pane { grid-column: 4; grid-row: 1; }
 .customizer { grid-column: 5; grid-row: 1 / 3; width: 254px; border-left: 1px solid #0b0d11; transition: width .18s ease, opacity .18s ease; }
 .customizer.closed { width: 0; opacity: 0; overflow: hidden; }
@@ -98,7 +98,33 @@ button { color: inherit; }
 .pane-action { margin-left: auto; margin-right: 7px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font: 10px var(--mono); }
 .pane-action:hover { color: #fff; }
 
-.editor-wrap { position: relative; height: 100%; overflow: hidden; background: #15191f; }
+.editor-wrap { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #15191f; }
+
+/* One tab per workspace file. ★ marks the main file, the one that renders. */
+.file-tabs { flex: none; height: 28px; display: flex; align-items: stretch; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; background: #12161b; border-bottom: 1px solid #080a0d; user-select: none; }
+.file-tabs::-webkit-scrollbar { display: none; }
+.file-tabs.error { box-shadow: 0 -2px var(--red) inset; }
+.file-tab { position: relative; flex: none; display: flex; align-items: center; gap: 5px; max-width: 220px; padding: 0 4px 0 10px; border-right: 1px solid #080a0d; background: #12161b; color: var(--muted); font: 10px var(--mono); }
+.file-tab:hover { background: #171c22; color: #c3cad2; }
+.file-tab.active { background: #15191f; color: var(--ink); box-shadow: 0 2px var(--blue) inset; }
+.file-tab-star { color: var(--yellow); font-size: 9px; }
+.file-tab:not(.main) .file-tab-star { display: none; }
+.file-tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: transparent; color: inherit; font: inherit; padding: 0; cursor: pointer; }
+.file-tab-dot { width: 5px; height: 5px; flex: none; border-radius: 50%; background: var(--yellow); opacity: 0; }
+.file-tab.dirty .file-tab-dot, .file-tab.changed .file-tab-dot { opacity: 1; }
+.file-tab-menu { width: 18px; height: 18px; flex: none; border: 0; border-radius: 2px; background: transparent; color: var(--dim); cursor: pointer; font: 11px var(--mono); line-height: 1; opacity: 0; }
+.file-tab:hover .file-tab-menu, .file-tab.active .file-tab-menu, .file-tab-menu:focus-visible { opacity: 1; }
+.file-tab-menu:hover { background: #252c35; color: #fff; }
+.file-tab-input { width: 130px; border: 1px solid var(--blue); background: #101419; color: var(--ink); font: 10px var(--mono); padding: 2px 4px; outline: none; }
+.file-tab-add { flex: none; width: 28px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font: 14px var(--mono); }
+.file-tab-add:hover { color: #fff; background: #171c22; }
+.file-menu { position: fixed; z-index: 30; min-width: 128px; display: grid; padding: 4px; border: 1px solid var(--line-hot); border-radius: 3px; background: #1d232b; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+.file-menu[hidden] { display: none; }
+.file-menu button { border: 0; border-radius: 2px; background: transparent; color: #c3cad2; text-align: left; padding: 6px 9px; cursor: pointer; font: 10px var(--mono); }
+.file-menu button:hover:not(:disabled) { background: #2a323c; color: #fff; }
+.file-menu button:disabled { color: var(--dim); cursor: default; }
+.file-menu button.confirm { color: var(--red); }
+
 .editor-overlay { position: absolute; top: 7px; right: 13px; z-index: 4; display: flex; align-items: center; gap: 7px; pointer-events: none; }
 .editor-overlay > * { pointer-events: auto; }
 #dirtyIndicator { width: 5px; height: 5px; border-radius: 50%; background: var(--yellow); opacity: 0; transition: opacity .15s; }

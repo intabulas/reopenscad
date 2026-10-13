@@ -4,7 +4,7 @@
 //! load OpenSCAD WASM, or shell out to any CAD engine.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -259,6 +259,63 @@ pub struct MultipartCompileOutput {
     pub messages: Vec<String>,
 }
 
+/// The file a single-source [`Project`] stores its code under, and the main
+/// file a workspace starts with.
+pub const DEFAULT_MAIN_FILE: &str = "main.scad";
+
+/// Every source a compile can see: the file being rendered plus the files it
+/// may `include`/`use` by name.
+///
+/// File names are matched exactly; deciding which names are acceptable is the
+/// workspace store's job, not the evaluator's. `BTreeMap` so two projects with
+/// the same files compare equal and serialize in the same order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    pub main: String,
+    pub files: BTreeMap<String, String>,
+}
+
+impl Project {
+    /// A project holding one file, which is also the one rendered.
+    pub fn single(source: impl Into<String>) -> Self {
+        Self {
+            main: DEFAULT_MAIN_FILE.to_string(),
+            files: BTreeMap::from([(DEFAULT_MAIN_FILE.to_string(), source.into())]),
+        }
+    }
+
+    fn main_source(&self) -> Result<&str, EngineError> {
+        self.files
+            .get(&self.main)
+            .map(String::as_str)
+            .ok_or_else(|| EngineError::new(format!("Main file {:?} does not exist.", self.main)))
+    }
+}
+
+impl From<&str> for Project {
+    fn from(source: &str) -> Self {
+        Self::single(source)
+    }
+}
+
+impl From<&String> for Project {
+    fn from(source: &String) -> Self {
+        Self::single(source.as_str())
+    }
+}
+
+impl From<String> for Project {
+    fn from(source: String) -> Self {
+        Self::single(source)
+    }
+}
+
+impl From<&Project> for Project {
+    fn from(project: &Project) -> Self {
+        project.clone()
+    }
+}
+
 /// Read-only access to a workspace/project virtual file system.
 ///
 /// Paths passed to [`SourceLoader::load`] are normalized, relative virtual
@@ -365,10 +422,7 @@ impl SourceLoader for BundledLibrary {
     fn load(&self, virtual_path: &str) -> Result<Option<String>, String> {
         // Exact match only. `strip_prefix("./")` is the single spelling
         // tolerance granted, and it cannot introduce a new reachable name.
-        let requested = virtual_path
-            .trim()
-            .strip_prefix("./")
-            .unwrap_or_else(|| virtual_path.trim());
+        let requested = file_directive_key(virtual_path);
         Ok(BUNDLED_LIBRARY_SOURCES
             .iter()
             .find(|(name, _)| *name == requested)
@@ -386,99 +440,175 @@ impl SourceLoader for BundledLibrary {
     }
 }
 
+/// Serves a [`Project`]'s files, falling back to the bundled library.
+///
+/// Workspace files come first, so a workspace `units.scad` replaces the
+/// bundled one everywhere — including inside bundled `shapes.scad`, the way a
+/// file earlier on OpenSCAD's library path would. The same exact-match policy
+/// as [`BUNDLED_LIBRARY_SOURCES`] applies: a name either is a key or is not.
+struct ProjectLoader<'a> {
+    project: &'a Project,
+}
+
+impl SourceLoader for ProjectLoader<'_> {
+    fn load(&self, virtual_path: &str) -> Result<Option<String>, String> {
+        let requested = file_directive_key(virtual_path);
+        if let Some(source) = self.project.files.get(requested) {
+            return Ok(Some(source.clone()));
+        }
+        BUNDLED_LIBRARY.load(virtual_path)
+    }
+
+    fn library_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .project
+            .files
+            .keys()
+            .filter(|name| **name != self.project.main)
+            .cloned()
+            .chain(BUNDLED_LIBRARY.library_paths())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+/// The one spelling tolerance a directive path gets: a leading `./`.
+fn file_directive_key(path: &str) -> &str {
+    path.trim()
+        .strip_prefix("./")
+        .unwrap_or_else(|| path.trim())
+}
+
+/// A parsed file with its `include`s spliced in and its `use`s kept apart.
+///
+/// `use` cannot be spliced: a used file's definitions must keep seeing that
+/// file's own top-level variables, which the caller must not see, so each one
+/// is evaluated in a scope of its own (see `Evaluator::import_used`).
+#[derive(Debug, Default)]
+struct Program {
+    statements: Vec<Stmt>,
+    uses: Vec<Program>,
+}
+
 /// How many files one program may pull in, and how deep the chain may go.
 /// Both are DoS guards: the table is finite, but a cycle is not.
 const MAX_INCLUDED_FILES: usize = 32;
 const MAX_INCLUDE_DEPTH: usize = 8;
 
-/// Splice `include`/`use` directives into `statements` before evaluation.
+/// Splice `include` directives into `statements` before evaluation and
+/// collect `use` directives alongside.
 ///
 /// `include` behaves textually: the file's definitions *and* its top-level
 /// assignments and geometry are spliced in place, so the including file can
-/// override an included variable (§17). `use` contributes function and module
-/// definitions only.
+/// override an included variable (§17). An included file's own `use`s come
+/// along with it, as they would textually. `use` contributes function and
+/// module definitions only; see [`Program`].
+///
+/// `file` names the file `statements` came from, or `None` for the main file,
+/// whose errors stay unprefixed.
 fn resolve_file_directives(
     statements: Vec<Stmt>,
+    file: Option<&str>,
     loader: &dyn SourceLoader,
     active: &mut Vec<String>,
     loaded: &mut usize,
-) -> Result<Vec<Stmt>, EngineError> {
+) -> Result<Program, EngineError> {
+    let mut program = Program::default();
     if !statements
         .iter()
         .any(|statement| matches!(statement, Stmt::FileDirective { .. }))
     {
-        return Ok(statements);
+        program.statements = statements;
+        return Ok(program);
     }
-    let mut resolved = Vec::with_capacity(statements.len());
+    let in_file = |message: String| match file {
+        Some(file) => EngineError::new(format!("{file}: {message}")),
+        None => EngineError::new(message),
+    };
+    program.statements.reserve(statements.len());
     for statement in statements {
         let Stmt::FileDirective { path, line, mode } = statement else {
-            resolved.push(statement);
+            program.statements.push(statement);
             continue;
         };
         // A file already being expanded higher up the chain would loop
         // forever; OpenSCAD's own behavior here is to not re-enter. The key is
         // the same spelling `load` matches on, so `x` and `./x` cannot slip
         // past each other into a cycle.
-        let key = path
-            .trim()
-            .strip_prefix("./")
-            .unwrap_or(path.trim())
-            .to_string();
+        let key = file_directive_key(&path).to_string();
         if active.contains(&key) {
             continue;
         }
         let Some(source) = loader
             .load(&path)
-            .map_err(|error| EngineError::new(format!("Line {line}: {error}")))?
+            .map_err(|error| in_file(format!("Line {line}: {error}")))?
         else {
             let available = loader.library_paths().join(", ");
-            return Err(EngineError::new(format!(
-                "Line {line}: {path:?} is not a bundled library. \
-                 This service has no user file system; available libraries are: {available}."
+            return Err(in_file(format!(
+                "Line {line}: {path:?} is not a file in this workspace or a bundled \
+                 library. Available: {available}."
             )));
         };
         *loaded += 1;
         if *loaded > MAX_INCLUDED_FILES || active.len() >= MAX_INCLUDE_DEPTH {
-            return Err(EngineError::new(format!(
+            return Err(in_file(format!(
                 "Line {line}: include/use exceeds the {MAX_INCLUDED_FILES}-file, \
                  {MAX_INCLUDE_DEPTH}-deep limit."
             )));
         }
-        let tokens = Lexer::new(&source).tokenize()?;
-        let parsed = Parser::new(tokens).parse_program()?;
-        active.push(key);
-        let expanded = resolve_file_directives(parsed, loader, active, loaded)?;
+        let prefixed = |error: EngineError| EngineError::new(format!("{key}: {error}"));
+        let tokens = Lexer::new(&source).tokenize().map_err(prefixed)?;
+        let parsed = Parser::new(tokens).parse_program().map_err(prefixed)?;
+        active.push(key.clone());
+        let expanded = resolve_file_directives(parsed, Some(&key), loader, active, loaded)?;
         active.pop();
         match mode {
             FileDirectiveMode::Include => {
-                resolved.extend(expanded.into_iter().map(|statement| match statement {
-                    // Marking the origin keeps an included default from
-                    // tripping the "assigned more than once" warning when the
-                    // including file overrides it.
-                    Stmt::Assign {
-                        name, expression, ..
-                    } => Stmt::Assign {
-                        name,
-                        expression,
-                        from_include: true,
-                    },
-                    statement => statement,
-                }))
+                program
+                    .statements
+                    .extend(
+                        expanded
+                            .statements
+                            .into_iter()
+                            .map(|statement| match statement {
+                                // Marking the origin keeps an included default from
+                                // tripping the "assigned more than once" warning when
+                                // the including file overrides it.
+                                Stmt::Assign {
+                                    name, expression, ..
+                                } => Stmt::Assign {
+                                    name,
+                                    expression,
+                                    from_include: true,
+                                },
+                                statement => statement,
+                            }),
+                    );
+                program.uses.extend(expanded.uses);
             }
-            FileDirectiveMode::Use => resolved.extend(expanded.into_iter().filter(|statement| {
-                matches!(statement, Stmt::Function { .. } | Stmt::Module { .. })
-            })),
+            FileDirectiveMode::Use => program.uses.push(expanded),
         }
     }
-    Ok(resolved)
+    Ok(program)
 }
 
-/// Parse `source` and expand its `include`/`use` directives against the
-/// bundled library.
-fn parse_resolved_program(source: &str) -> Result<Vec<Stmt>, EngineError> {
-    let tokens = Lexer::new(source).tokenize()?;
+/// Parse `project`'s main file and resolve its `include`/`use` directives
+/// against the project's other files and the bundled library.
+fn parse_resolved_program(project: &Project) -> Result<Program, EngineError> {
+    let tokens = Lexer::new(project.main_source()?).tokenize()?;
     let statements = Parser::new(tokens).parse_program()?;
-    resolve_file_directives(statements, &BUNDLED_LIBRARY, &mut Vec::new(), &mut 0)
+    // Seeded with the main file so `include <main.scad>` from inside it is a
+    // no-op like every other cycle, rather than splicing a copy of itself in.
+    let mut active = vec![file_directive_key(&project.main).to_string()];
+    resolve_file_directives(
+        statements,
+        None,
+        &ProjectLoader { project },
+        &mut active,
+        &mut 0,
+    )
 }
 
 /// Tolerance-aware relationship between two visible objects.
@@ -597,26 +727,28 @@ fn describe_geometry_panic(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub fn compile(
-    source: &str,
+    source: impl Into<Project>,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_unguarded(source, quality, cancellation))
+    let project = source.into();
+    catch_geometry_panic(|| compile_unguarded(&project, quality, cancellation))
 }
 
 fn compile_unguarded(
-    source: &str,
+    project: &Project,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let program = parse_resolved_program(project)?;
+    let statements = &program.statements;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
         exact: true,
         ..Evaluator::default()
     };
-    let shape = evaluator.evaluate(&statements)?;
+    let shape = evaluator.evaluate_program(&program)?;
     if shape.dimension() != ShapeDimension::Solid {
         return Err(EngineError::new("The model contains no 3D geometry."));
     }
@@ -661,17 +793,18 @@ fn kernel_report(meshed: &MeshedShape, resolution: usize) -> Vec<String> {
 /// baseline the parity suite measures the exact kernel against, and the escape
 /// hatch if a model turns out to be one the kernel handles badly.
 pub fn compile_sampled(
-    source: &str,
+    source: impl Into<Project>,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let program = parse_resolved_program(&source.into())?;
+    let statements = &program.statements;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
         ..Evaluator::default()
     };
-    let shape = evaluator.evaluate(&statements)?;
+    let shape = evaluator.evaluate_program(&program)?;
     if shape.dimension() != ShapeDimension::Solid {
         return Err(EngineError::new("The model contains no 3D geometry."));
     }
@@ -698,8 +831,9 @@ pub fn compile_sampled(
 /// This is appropriate for validating workspace edits containing 2D geometry
 /// or definitions-only libraries. It still reports syntax, expression, module,
 /// assertion, and evaluation-limit errors.
-pub fn validate(source: &str) -> Result<Vec<String>, EngineError> {
-    let statements = parse_resolved_program(source)?;
+pub fn validate(source: impl Into<Project>) -> Result<Vec<String>, EngineError> {
+    let program = parse_resolved_program(&source.into())?;
+    let statements = &program.statements;
     // Nothing is meshed here, so the kernel choice cannot change the answer —
     // but it does decide which approximation warnings are emitted, and the
     // approximations validation should describe are the default path's.
@@ -707,7 +841,7 @@ pub fn validate(source: &str) -> Result<Vec<String>, EngineError> {
         exact: true,
         ..Evaluator::default()
     };
-    evaluator.evaluate_objects(&statements)?;
+    evaluator.evaluate_program_objects(&program)?;
     let mut messages = evaluator.diagnostics;
     messages.push(format!("Parsed {} top-level statements.", statements.len()));
     Ok(messages)
@@ -804,7 +938,8 @@ fn exact_multipart_meshes(
 /// The cache is deliberately tiny — the last few distinct compiles — because
 /// entries hold meshes and shape trees, and it is keyed by the whole source
 /// text rather than a digest so a hash collision cannot serve the wrong
-/// geometry.
+/// geometry. The key is the whole [`Project`], not the main file: editing an
+/// included file changes the model without changing a byte of the main one.
 static COMPILED_PARTS: Mutex<Vec<CompiledPartsEntry>> = Mutex::new(Vec::new());
 
 /// How many distinct compiles are kept. Two covers the common pairing of a
@@ -816,16 +951,19 @@ const COMPILED_PARTS_CACHE_ENTRIES: usize = 2;
 const COMPILED_PARTS_CACHE_MAX_TRIANGLES: usize = 1_000_000;
 
 struct CompiledPartsEntry {
-    source: String,
+    project: Project,
     quality: Quality,
     output: Arc<MultipartCompileOutput>,
 }
 
-fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<MultipartCompileOutput>> {
+fn cached_compiled_parts(
+    project: &Project,
+    quality: Quality,
+) -> Option<Arc<MultipartCompileOutput>> {
     let mut cache = COMPILED_PARTS.lock().ok()?;
     let index = cache
         .iter()
-        .position(|entry| entry.quality == quality && entry.source == source)?;
+        .position(|entry| entry.quality == quality && entry.project == *project)?;
     // Most-recently-used first, so the eviction below drops the coldest entry.
     let entry = cache.remove(index);
     let output = Arc::clone(&entry.output);
@@ -833,7 +971,11 @@ fn cached_compiled_parts(source: &str, quality: Quality) -> Option<Arc<Multipart
     Some(output)
 }
 
-fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<MultipartCompileOutput>) {
+fn remember_compiled_parts(
+    project: &Project,
+    quality: Quality,
+    output: &Arc<MultipartCompileOutput>,
+) {
     let triangles = output.mesh.triangles.len()
         + output
             .parts
@@ -847,11 +989,11 @@ fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<Multipar
     let Ok(mut cache) = COMPILED_PARTS.lock() else {
         return;
     };
-    cache.retain(|entry| entry.quality != quality || entry.source != source);
+    cache.retain(|entry| entry.quality != quality || entry.project != *project);
     cache.insert(
         0,
         CompiledPartsEntry {
-            source: source.to_string(),
+            project: project.clone(),
             quality,
             output: Arc::clone(output),
         },
@@ -865,15 +1007,16 @@ fn remember_compiled_parts(source: &str, quality: Quality, output: &Arc<Multipar
 /// hands back a shared result instead of a private copy, so a repeat compile
 /// costs a reference-count bump rather than a full evaluation and CSG pass.
 pub fn compile_parts_shared(
-    source: &str,
+    source: impl Into<Project>,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<MultipartCompileOutput>, EngineError> {
-    if let Some(output) = cached_compiled_parts(source, quality) {
+    let project = source.into();
+    if let Some(output) = cached_compiled_parts(&project, quality) {
         return Ok(output);
     }
-    let output = Arc::new(compile_parts(source, quality, cancellation)?);
-    remember_compiled_parts(source, quality, &output);
+    let output = Arc::new(compile_parts(&project, quality, cancellation)?);
+    remember_compiled_parts(&project, quality, &output);
     Ok(output)
 }
 
@@ -885,21 +1028,22 @@ pub fn compile_parts_shared(
 static COMPILED_WHOLE: Mutex<Vec<CompiledWholeEntry>> = Mutex::new(Vec::new());
 
 struct CompiledWholeEntry {
-    source: String,
+    project: Project,
     quality: Quality,
     output: Arc<CompileOutput>,
 }
 
 /// Compiles the whole model, reusing an identical earlier compile.
 pub fn compile_shared(
-    source: &str,
+    source: impl Into<Project>,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Arc<CompileOutput>, EngineError> {
+    let project = source.into();
     if let Ok(mut cache) = COMPILED_WHOLE.lock() {
         if let Some(index) = cache
             .iter()
-            .position(|entry| entry.quality == quality && entry.source == source)
+            .position(|entry| entry.quality == quality && entry.project == project)
         {
             let entry = cache.remove(index);
             let output = Arc::clone(&entry.output);
@@ -907,14 +1051,14 @@ pub fn compile_shared(
             return Ok(output);
         }
     }
-    let output = Arc::new(compile(source, quality, cancellation)?);
+    let output = Arc::new(compile(&project, quality, cancellation)?);
     if output.mesh.triangles.len() <= COMPILED_PARTS_CACHE_MAX_TRIANGLES {
         if let Ok(mut cache) = COMPILED_WHOLE.lock() {
-            cache.retain(|entry| entry.quality != quality || entry.source != source);
+            cache.retain(|entry| entry.quality != quality || entry.project != project);
             cache.insert(
                 0,
                 CompiledWholeEntry {
-                    source: source.to_string(),
+                    project: project.clone(),
                     quality,
                     output: Arc::clone(&output),
                 },
@@ -931,26 +1075,28 @@ pub fn compile_shared(
 /// the exact behavior of [`compile`]: it is meshed from the implicit union, not
 /// formed by concatenating potentially overlapping part meshes.
 pub fn compile_parts(
-    source: &str,
+    source: impl Into<Project>,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    catch_geometry_panic(|| compile_parts_unguarded(source, quality, cancellation))
+    let project = source.into();
+    catch_geometry_panic(|| compile_parts_unguarded(&project, quality, cancellation))
 }
 
 fn compile_parts_unguarded(
-    source: &str,
+    project: &Project,
     quality: Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<MultipartCompileOutput, EngineError> {
-    let statements = parse_resolved_program(source)?;
+    let program = parse_resolved_program(project)?;
+    let statements = &program.statements;
     let mut evaluator = Evaluator {
         cancellation,
         preview: matches!(quality, Quality::Preview),
         exact: true,
         ..Evaluator::default()
     };
-    let shapes = evaluator.evaluate_objects(&statements)?;
+    let shapes = evaluator.evaluate_program_objects(&program)?;
     let solid_shapes = shapes
         .into_iter()
         .filter(|shape| shape.dimension() == ShapeDimension::Solid)
@@ -978,7 +1124,7 @@ fn compile_parts_unguarded(
         }
     };
 
-    let mut names = top_level_object_names(&statements);
+    let mut names = top_level_object_names(statements);
     if names.len() != solid_shapes.len() {
         names = (1..=solid_shapes.len())
             .map(|index| format!("object {index}"))
@@ -3279,8 +3425,21 @@ impl Evaluator<'_> {
     }
 
     fn evaluate_objects(&mut self, statements: &[Stmt]) -> Result<Vec<Shape>, EngineError> {
-        take_expression_warnings();
-        self.stack_origin = current_stack_address();
+        self.evaluate_objects_using(statements, &[])
+    }
+
+    fn evaluate_program(&mut self, program: &Program) -> Result<Shape, EngineError> {
+        self.evaluate_program_objects(program).and_then(|shapes| {
+            Shape::union(shapes)
+                .ok_or_else(|| EngineError::new("The program produced no geometry."))
+        })
+    }
+
+    fn evaluate_program_objects(&mut self, program: &Program) -> Result<Vec<Shape>, EngineError> {
+        self.evaluate_objects_using(&program.statements, &program.uses)
+    }
+
+    fn base_environment(&self) -> Environment {
         let mut environment = Environment::new();
         environment.extend([
             ("$fn".into(), Value::Number(0.0)),
@@ -3290,7 +3449,20 @@ impl Evaluator<'_> {
             ("$preview".into(), Value::Bool(self.preview)),
             ("$children".into(), Value::Number(0.0)),
         ]);
-        let result = self.statements(statements, &environment, true);
+        environment
+    }
+
+    fn evaluate_objects_using(
+        &mut self,
+        statements: &[Stmt],
+        uses: &[Program],
+    ) -> Result<Vec<Shape>, EngineError> {
+        take_expression_warnings();
+        self.stack_origin = current_stack_address();
+        let mut environment = self.base_environment();
+        let result = self
+            .import_used_programs(uses, &mut environment)
+            .and_then(|()| self.statements(statements, &environment, true));
         self.diagnostics.extend(take_expression_warnings());
         let mut shapes = result?;
         // A `!` anywhere in the program overrides everything else, so it is
@@ -3311,22 +3483,17 @@ impl Evaluator<'_> {
         Ok(shapes)
     }
 
-    /// Evaluates a lexical scope.
+    /// Binds a lexical scope's assignments, functions and modules.
     ///
-    /// The environment is borrowed, not owned: a scope that declares no
-    /// variables and no functions cannot change what its caller sees, so it
-    /// reads the caller's map directly. Only a scope that actually binds
-    /// something pays for a copy, and it makes that copy here rather than at
-    /// every call site. On a model whose geometry comes out of nested `for`
-    /// loops that is the difference between one hash-map clone per loop and
-    /// one per iteration per nesting level.
-    fn statements(
+    /// Returns the scope's own environment, or `None` when it binds no
+    /// variable or function and can read `environment` directly. Its modules
+    /// are installed into `self.modules`; restoring the caller's table when the
+    /// scope ends is the caller's job.
+    fn enter_scope(
         &mut self,
         statements: &[Stmt],
         environment: &Environment,
-        group_top_level: bool,
-    ) -> Result<Vec<Shape>, EngineError> {
-        self.consume_work(1)?;
+    ) -> Result<Option<Environment>, EngineError> {
         // OpenSCAD assignments and module definitions apply throughout their
         // lexical scope, including statements that appear before the definition.
         let mut final_assignments = Vec::<(String, Expr)>::new();
@@ -3390,9 +3557,8 @@ impl Evaluator<'_> {
         // single evaluation matters for intentionally nondeterministic rands().
         // Nothing below writes to the environment unless this scope binds a
         // name or a function, so only then is a private copy made.
-        let scope_environment;
-        let environment: &Environment = if final_assignments.is_empty() && !declares_functions {
-            environment
+        let scope_environment = if final_assignments.is_empty() && !declares_functions {
+            None
         } else {
             let mut scope = environment.clone();
             let assignment_names = assignment_indices.keys().cloned().collect::<HashSet<_>>();
@@ -3425,9 +3591,9 @@ impl Evaluator<'_> {
             if declares_functions {
                 install_scope_functions(&mut scope, &same_scope_functions);
             }
-            scope_environment = scope;
-            &scope_environment
+            Some(scope)
         };
+        let environment = scope_environment.as_ref().unwrap_or(environment);
 
         let outer_modules = Rc::clone(&self.modules);
         // A scope that declares no modules inherits the caller's table
@@ -3459,6 +3625,94 @@ impl Evaluator<'_> {
             );
             install_scope_modules(&mut self.modules, &outer_modules, &same_scope_modules);
         }
+        Ok(scope_environment)
+    }
+
+    /// Binds what each `use`d file defines into `environment` and
+    /// `self.modules`, as the root scope's starting point.
+    ///
+    /// Each file is evaluated as a scope of its own over a fresh base
+    /// environment, so its functions and modules capture *its* top-level
+    /// variables — which the caller never sees — and the caller's definitions,
+    /// bound afterwards by `statements`, shadow them. Only definitions are
+    /// exported: a used file's geometry is dropped, and so is everything it
+    /// `use`d in turn, because `use` is not transitive.
+    fn import_used_programs(
+        &mut self,
+        uses: &[Program],
+        environment: &mut Environment,
+    ) -> Result<(), EngineError> {
+        for used in uses {
+            let caller_modules = std::mem::take(&mut self.modules);
+            let imported = self.evaluate_used_definitions(used);
+            let used_modules = std::mem::replace(&mut self.modules, caller_modules);
+            let (used_environment, definitions) = imported?;
+            let mut table = None;
+            for definition in &definitions {
+                match definition {
+                    Stmt::Function { name, .. } => {
+                        if let Some(value) = used_environment.get(name) {
+                            environment.insert(name.clone(), value.clone());
+                        }
+                    }
+                    Stmt::Module { name, .. } => {
+                        if let Some(module) = used_modules.get(name) {
+                            table
+                                .get_or_insert_with(|| ModuleTable::clone(&self.modules))
+                                .insert(name.clone(), module.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(table) = table {
+                self.modules = Rc::new(table);
+            }
+        }
+        Ok(())
+    }
+
+    /// The scope a `use`d file's definitions close over, and the definitions.
+    fn evaluate_used_definitions(
+        &mut self,
+        used: &Program,
+    ) -> Result<(Environment, Vec<Stmt>), EngineError> {
+        let mut environment = self.base_environment();
+        self.import_used_programs(&used.uses, &mut environment)?;
+        let definitions = used
+            .statements
+            .iter()
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Assign { .. } | Stmt::Function { .. } | Stmt::Module { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let scope = self.enter_scope(&definitions, &environment)?;
+        Ok((scope.unwrap_or(environment), definitions))
+    }
+
+    /// Evaluates a lexical scope.
+    ///
+    /// The environment is borrowed, not owned: a scope that declares no
+    /// variables and no functions cannot change what its caller sees, so it
+    /// reads the caller's map directly. Only a scope that actually binds
+    /// something pays for a copy, and it makes that copy here rather than at
+    /// every call site. On a model whose geometry comes out of nested `for`
+    /// loops that is the difference between one hash-map clone per loop and
+    /// one per iteration per nesting level.
+    fn statements(
+        &mut self,
+        statements: &[Stmt],
+        environment: &Environment,
+        group_top_level: bool,
+    ) -> Result<Vec<Shape>, EngineError> {
+        self.consume_work(1)?;
+        let outer_modules = Rc::clone(&self.modules);
+        let scope_environment = self.enter_scope(statements, environment)?;
+        let environment = scope_environment.as_ref().unwrap_or(environment);
 
         let result = (|| {
             let mut shapes = Vec::new();
@@ -8873,8 +9127,8 @@ mod tests {
     }
 
     fn evaluate_source(source: &str) -> Result<Shape, EngineError> {
-        let statements = parse_resolved_program(source)?;
-        Evaluator::default().evaluate(&statements)
+        let program = parse_resolved_program(&Project::single(source))?;
+        Evaluator::default().evaluate_program(&program)
     }
 
     /// Point transformed by whatever `rotate(...)` the source applies, read
@@ -9028,10 +9282,13 @@ mod tests {
     #[test]
     fn polygon_rejects_out_of_range_path_indices() {
         let mut evaluator = Evaluator::default();
-        let statements =
-            parse_resolved_program("polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);")
-                .expect("parse");
-        evaluator.evaluate_objects(&statements).expect("evaluate");
+        let program = parse_resolved_program(&Project::single(
+            "polygon(points=[[0,0],[1,0],[1,1]], paths=[[0,1,9]]);",
+        ))
+        .expect("parse");
+        evaluator
+            .evaluate_program_objects(&program)
+            .expect("evaluate");
         assert!(evaluator
             .diagnostics
             .iter()
@@ -9103,9 +9360,10 @@ mod tests {
             evaluate_source("color(\"blue\") translate([5,0,0]) cube(2);").expect("evaluate");
         assert_eq!(shape.stated_color(), Some([0.0, 0.0, 1.0, 1.0]));
 
-        let statements = parse_resolved_program("color(\"nosuchcolor\") cube(2);").expect("parse");
+        let program = parse_resolved_program(&Project::single("color(\"nosuchcolor\") cube(2);"))
+            .expect("parse");
         let mut evaluator = Evaluator::default();
-        let shape = evaluator.evaluate(&statements).expect("evaluate");
+        let shape = evaluator.evaluate_program(&program).expect("evaluate");
         assert_eq!(shape.stated_color(), None);
         assert!(evaluator
             .diagnostics
@@ -9161,7 +9419,7 @@ mod tests {
                 .expect_err("only bundled libraries may be included")
                 .to_string();
             assert!(
-                error.contains("not a bundled library"),
+                error.contains("not a file in this workspace or a bundled library"),
                 "unexpected error for {path}: {error}"
             );
         }
@@ -9779,9 +10037,10 @@ mod tests {
 
     #[test]
     fn color_alpha_without_a_color_is_reported_rather_than_dropped() {
-        let statements = parse_resolved_program("color(alpha=0.5) cube(2);").expect("parse");
+        let program =
+            parse_resolved_program(&Project::single("color(alpha=0.5) cube(2);")).expect("parse");
         let mut evaluator = Evaluator::default();
-        let shape = evaluator.evaluate(&statements).expect("evaluate");
+        let shape = evaluator.evaluate_program(&program).expect("evaluate");
         // Geometry is untouched either way.
         assert!(shape.distance(Vec3::new(1.0, 1.0, 1.0)) < 0.0);
         assert_eq!(shape.stated_color(), None);
@@ -9793,10 +10052,12 @@ mod tests {
 
     #[test]
     fn an_unusable_color_alpha_never_drops_the_children() {
-        let statements =
-            parse_resolved_program("color(\"red\", alpha=\"opaque\") cube(2);").expect("parse");
+        let program = parse_resolved_program(&Project::single(
+            "color(\"red\", alpha=\"opaque\") cube(2);",
+        ))
+        .expect("parse");
         let mut evaluator = Evaluator::default();
-        let shape = evaluator.evaluate(&statements).expect("evaluate");
+        let shape = evaluator.evaluate_program(&program).expect("evaluate");
         assert!(shape.distance(Vec3::new(1.0, 1.0, 1.0)) < 0.0);
         assert_eq!(shape.stated_color(), Some([1.0, 0.0, 0.0, 1.0]));
         assert!(evaluator
@@ -10517,6 +10778,10 @@ mod spec_comprehensions;
 #[cfg(test)]
 #[path = "engine/spec_bounds_pruning.rs"]
 mod spec_bounds_pruning;
+
+#[cfg(test)]
+#[path = "engine/spec_workspace_files.rs"]
+mod spec_workspace_files;
 
 /// The exact polyhedral CSG kernel bridge.
 ///

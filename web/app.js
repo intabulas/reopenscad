@@ -294,12 +294,31 @@ let workspaceHasLocalChanges = false;
 let workspaceConflict = null;
 let applyingRemoteUpdate = false;
 let aiUpdatedRanges = [];
+// A workspace is a set of files, one of which (`mainFile`) renders. The editor always shows
+// `activeFile`, and the single-buffer state above — `workspaceSavedCode`,
+// `workspaceHasLocalChanges`, the save queue — describes that file. Files not on screen keep
+// their text in `fileBuffers` as { saved, local }; `saved` is null when it has not been
+// fetched or a remote change made it stale.
+let mainFile = 'main.scad';
+let activeFile = 'main.scad';
+let workspaceFiles = ['main.scad'];
+const fileBuffers = new Map();
+// Tabs showing a dot for a remote change the user has not opened yet.
+const filesChangedRemotely = new Set();
+// For files not on screen: the events of the latest AI revision that changed each one, held
+// until the file is opened so its edit can be highlighted then. Only the latest revision is
+// kept because only its byte ranges describe the file's current text (`finalAiUpdate` makes
+// the same choice for the open file).
+const pendingAiRanges = new Map();
 let sceneObjects = [];
 let selectedObjectId = null;
 let intersectionIds = new Set();
 let eventPollTimer = null;
 let eventPollController = null;
 let workspaceSaveFailures = 0;
+// The last validation error a save was refused with, so a render that flushes the same
+// broken text again does not log it twice.
+let lastInvalidSaveMessage = '';
 let nextWorkspaceNavigation = 'replace';
 // Viewer-settings PATCHes still awaiting a reply, counted per workspace id. A remote payload
 // that predates them is stale for those fields, so it must not apply them back over the user
@@ -1085,6 +1104,7 @@ function syncEditor(markDirty = true) {
   lineNumbers.textContent = Array.from({ length: editor.value.split('\n').length }, (_, i) => i + 1).join('\n');
   if (markDirty) {
     dirtyIndicator.classList.add('visible');
+    $('#fileTabs .file-tab.active')?.classList.add('dirty');
     scheduleWorkspaceSave();
   }
   updateCursor();
@@ -1206,9 +1226,53 @@ function workspaceStorageKey(id = workspaceId) {
   return `reopenscad.workspace.${id || 'draft'}`;
 }
 
+// `code` is the main file's draft, which is the only shape older builds stored; `files` holds
+// drafts of the other files that have unsaved text, and `active` the tab that was open.
 function storeLocalWorkspace() {
   if (!workspaceId) return;
-  localStorage.setItem(workspaceStorageKey(), JSON.stringify({ code: editor.value, revision: workspaceRevision }));
+  const files = {};
+  for (const [name, buffer] of fileBuffers) {
+    if (name !== mainFile && buffer.local !== buffer.saved) files[name] = buffer.local;
+  }
+  if (activeFile !== mainFile && workspaceHasLocalChanges) files[activeFile] = editor.value;
+  const mainDraft = activeFile === mainFile ? editor.value : fileBuffers.get(mainFile)?.local;
+  localStorage.setItem(workspaceStorageKey(), JSON.stringify({
+    ...(typeof mainDraft === 'string' ? { code: mainDraft } : {}),
+    files,
+    active: activeFile,
+    revision: workspaceRevision,
+  }));
+}
+
+// Back to one file, as every workspace starts and as a read-only view always is.
+function resetWorkspaceFiles() {
+  mainFile = 'main.scad';
+  activeFile = 'main.scad';
+  workspaceFiles = ['main.scad'];
+  fileBuffers.clear();
+  filesChangedRemotely.clear();
+  pendingAiRanges.clear();
+  renderFileTabs();
+}
+
+// Takes the file list and main file from a workspace payload. Returns whether the open file
+// still exists.
+function applyWorkspaceFiles(workspace) {
+  if (typeof workspace.main === 'string') mainFile = workspace.main;
+  if (Array.isArray(workspace.files)) {
+    workspaceFiles = workspace.files.map((file) => String(file.name));
+    for (const name of [...fileBuffers.keys()]) if (!workspaceFiles.includes(name)) fileBuffers.delete(name);
+    for (const name of [...filesChangedRemotely]) if (!workspaceFiles.includes(name)) filesChangedRemotely.delete(name);
+  }
+  renderFileTabs();
+  return workspaceFiles.includes(activeFile);
+}
+
+async function fetchFileCode(name, id = workspaceId) {
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(id)}/code?path=${encodeURIComponent(name)}`);
+  const payload = await response.json();
+  if (!response.ok || typeof payload.code !== 'string') throw new Error(payload.error || `Could not read ${name}.`);
+  return payload.code;
 }
 
 function finalAiUpdate(payload, workspace) {
@@ -1216,9 +1280,12 @@ function finalAiUpdate(payload, workspace) {
   if (!Array.isArray(events) || !events.length) return { isAi: false, ranges: [] };
   const finalEvent = events.reduce((latest, event) => Number(event.revision) >= Number(latest.revision) ? event : latest);
   if (finalEvent.source !== 'ai') return { isAi: false, ranges: [] };
+  // Only edits to the file on screen have ranges worth highlighting. Events logged before
+  // workspaces had files carry no path and were all main-file edits.
+  const inEditor = (event) => (event.path || mainFile) === activeFile;
   return {
     isAi: true,
-    ranges: events.filter((event) => event.source === 'ai' && Number(event.revision) === Number(finalEvent.revision)),
+    ranges: events.filter((event) => event.source === 'ai' && Number(event.revision) === Number(finalEvent.revision) && inEditor(event)),
   };
 }
 
@@ -1258,6 +1325,14 @@ function applyWorkspaceSettings(workspace) {
 
 function applyWorkspace(payload, { remote = false, force = false } = {}) {
   const workspace = workspaceFromPayload(payload);
+  applyWorkspaceFiles(workspace);
+  // The payload carries the main file's text as `code`. When another file is open, its text
+  // is whatever the caller fetched into `activeCode`, if anything changed it.
+  const incoming = activeFile === mainFile ? workspace.code : payload.activeCode;
+  if (activeFile !== mainFile && typeof workspace.code === 'string') {
+    const buffer = fileBuffers.get(mainFile);
+    if (!buffer || buffer.local === buffer.saved) fileBuffers.set(mainFile, { saved: workspace.code, local: workspace.code });
+  }
   // Into the address book — but only once there is something in it. Landing on
   // "/" mints an empty workspace every time, and recording those would bury the
   // user's actual work under a stack of blanks they never typed in. A workspace
@@ -1267,27 +1342,42 @@ function applyWorkspace(payload, { remote = false, force = false } = {}) {
   }
   const incomingRevision = Number(workspace.revision);
   let shouldRenderAiUpdate = false;
-  if (remote && !force && typeof workspace.code === 'string' && workspace.code !== editor.value && hasPendingLocalWorkspaceChanges()) {
+  // A remote change that left the main file as last saved (another file was edited) is not
+  // a conflict with unsaved typing: take the new revision and keep the editor as it is.
+  // Reported as not applied, so the caller does not mark the still-unsaved editor Synced.
+  if (typeof incoming !== 'string') {
+    // Nothing on screen changed: take the revision, leave the editor alone.
+    if (Number.isFinite(incomingRevision)) workspaceRevision = incomingRevision;
+    if (!force) applyWorkspaceSettings(workspace);
+    storeLocalWorkspace();
+    return !hasPendingLocalWorkspaceChanges();
+  }
+  if (remote && !force && incoming === workspaceSavedCode && hasPendingLocalWorkspaceChanges()) {
+    if (Number.isFinite(incomingRevision)) workspaceRevision = incomingRevision;
+    storeLocalWorkspace();
+    return false;
+  }
+  if (remote && !force && incoming !== editor.value && hasPendingLocalWorkspaceChanges()) {
     surfaceWorkspaceConflict(payload);
     return false;
   }
   if (workspace.id) setWorkspaceIdentity(String(workspace.id));
   if (Number.isFinite(incomingRevision)) workspaceRevision = incomingRevision;
-  if (typeof workspace.code === 'string' && workspace.code !== editor.value) {
+  if (incoming !== editor.value) {
     applyingRemoteUpdate = true;
-    editor.value = workspace.code;
+    editor.value = incoming;
     const aiUpdate = remote ? finalAiUpdate(payload, workspace) : { isAi: false, ranges: [] };
-    aiUpdatedRanges = aiUpdate.isAi ? normalizeUpdatedRanges(workspace.code, aiUpdate.ranges) : [];
+    aiUpdatedRanges = aiUpdate.isAi ? normalizeUpdatedRanges(incoming, aiUpdate.ranges) : [];
     $('#aiRevisionBadge').hidden = !aiUpdate.isAi;
     syncEditor(false);
     applyingRemoteUpdate = false;
     if (aiUpdate.isAi) {
       $('#aiRevisionBadge').hidden = false;
-      log(`AI updated workspace revision ${workspaceRevision}.`, 'success');
+      log(`AI updated ${activeFile} (workspace revision ${workspaceRevision}).`, 'success');
       shouldRenderAiUpdate = true;
     }
   }
-  workspaceSavedCode = typeof workspace.code === 'string' ? workspace.code : editor.value;
+  workspaceSavedCode = incoming;
   workspaceHasLocalChanges = false;
   workspaceConflict = null;
   $('#syncState').title = '';
@@ -1329,10 +1419,13 @@ function normalizeUpdatedRanges(code, ranges) {
 
 // A brand new workspace starts genuinely empty so the kick-start options are what a first
 // visitor sees. `navigation` decides whether the previous workspace stays reachable via Back.
-async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
+// `files` (name to source) and `main` make a multi-file workspace, as a fork of a shared
+// one does; otherwise `code` becomes the main file of a one-file workspace.
+async function createWorkspace(code = '', { navigation = 'replace', files = null, main = null } = {}) {
   leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   nextWorkspaceNavigation = navigation;
+  resetWorkspaceFiles();
   setSyncState('Creating', 'saving');
   try {
     const response = await fetch('/api/workspaces', {
@@ -1341,7 +1434,7 @@ async function createWorkspace(code = '', { navigation = 'replace' } = {}) {
       // Seeding the new workspace with the settings on screen is what "preserve it in case
       // the user creates a new workspace" means: the bed carries over instead of resetting.
       body: JSON.stringify({
-        code,
+        ...(files ? { files, main } : { code }),
         plate: localStorage.getItem(PLATE_STORAGE_KEY) || '',
         // `|| DEFAULT` would turn a deliberate 0 mm clearance back into 0.2.
         tolerance: readTolerance() ?? DEFAULT_TOLERANCE,
@@ -1372,6 +1465,7 @@ async function loadWorkspace(id) {
   leaveReadOnly();
   const generation = advanceWorkspaceGeneration();
   setWorkspaceIdentity(id, 'none');
+  resetWorkspaceFiles();
   setSyncState('Loading', 'saving');
   const cached = JSON.parse(localStorage.getItem(workspaceStorageKey(id)) || 'null');
   try {
@@ -1390,6 +1484,15 @@ async function loadWorkspace(id) {
     // Viewer settings are not part of the source, so they restore on every path — including
     // the divergent-cache and conflict branches below, which never reach applyWorkspace().
     applyWorkspaceSettings(remote);
+    applyWorkspaceFiles(remote);
+    // Unsaved text of files other than main comes back as their buffers; opening the tab
+    // fetches what is saved and offers the draft over it.
+    for (const [name, draft] of Object.entries(cached?.files || {})) {
+      if (name !== mainFile && workspaceFiles.includes(name) && typeof draft === 'string') {
+        fileBuffers.set(name, { saved: null, local: draft });
+      }
+    }
+    renderFileTabs();
     if (cached?.code && cached.code !== remote.code) {
       editor.value = cached.code;
       syncEditor(false);
@@ -1405,6 +1508,9 @@ async function loadWorkspace(id) {
     } else {
       applyWorkspace(payload);
       setSyncState('Synced', 'synced');
+    }
+    if (typeof cached?.active === 'string' && cached.active !== mainFile && workspaceFiles.includes(cached.active)) {
+      await openFile(cached.active);
     }
   } catch {
     if (generation !== workspaceGeneration || id !== workspaceId) return;
@@ -1494,6 +1600,7 @@ async function saveWorkspace() {
   const generation = workspaceGeneration;
   const baseRevision = workspaceRevision;
   const code = editor.value;
+  const path = activeFile;
   const controller = new AbortController();
   workspaceSaveController = controller;
   setSyncState('Saving', 'saving');
@@ -1503,7 +1610,7 @@ async function saveWorkspace() {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({ code, baseRevision, source: 'browser' }),
+        body: JSON.stringify({ path, code, baseRevision, source: 'browser' }),
       });
       const payload = await response.json();
       if (generation !== workspaceGeneration || id !== workspaceId) return false;
@@ -1512,13 +1619,34 @@ async function saveWorkspace() {
         storeLocalWorkspace();
         return false;
       }
+      if (response.status === 422) {
+        // The server is fine; the text is not. Saying so once and waiting for the next edit
+        // beats retrying it forever as if the network were down — which also dropped polling
+        // to its offline pace for as long as the file stayed broken.
+        workspaceOnline = true;
+        workspaceSaveFailures = 0;
+        const message = `${path}: ${payload.error || 'invalid source'}`.replace(`${path}: ${path}: `, `${path}: `);
+        if (message !== lastInvalidSaveMessage) log(`Not saved — ${message}`, 'error');
+        lastInvalidSaveMessage = message;
+        storeLocalWorkspace();
+        setSyncState('Invalid', 'error');
+        $('#syncState').title = 'The last edit does not validate, so it is kept locally. Fix it and it saves.';
+        return false;
+      }
       if (!response.ok) throw new Error(`Workspace service returned ${response.status}`);
+      lastInvalidSaveMessage = '';
+      $('#syncState').title = '';
       workspaceOnline = true;
       workspaceSaveFailures = 0;
       const workspace = workspaceFromPayload(payload);
       if (Number.isFinite(Number(workspace.revision))) workspaceRevision = Number(workspace.revision);
+      applyWorkspaceFiles(workspace);
       workspaceSavedCode = code;
       workspaceHasLocalChanges = editor.value !== code;
+      renderFileTabs();
+      // The server applied this save over edits to other files made since `baseRevision`
+      // (see `rebase_allowed`). Polling resumes from the new revision, so look at those now.
+      if (Number(workspace.revision) > baseRevision + 1) catchUpOtherFiles(id, generation, baseRevision, Number(workspace.revision));
       storeLocalWorkspace();
       setSyncState(workspaceHasLocalChanges ? 'Unsaved' : 'Synced', workspaceHasLocalChanges ? 'saving' : 'synced');
       if (workspaceHasLocalChanges) scheduleWorkspaceSave();
@@ -1578,7 +1706,10 @@ function beginWorkspacePolling(generation = workspaceGeneration) {
         applyWorkspaceSettings({ ...workspaceFromPayload(payload), id });
         const incomingRevision = Number(workspaceFromPayload(payload).revision);
         if (payload.changed === true && Number.isFinite(incomingRevision) && incomingRevision > workspaceRevision) {
+          const fileChanges = await reconcileRemoteFileEvents(payload, sinceRevision);
+          if (generation !== workspaceGeneration || id !== workspaceId) return;
           const applied = applyWorkspace(payload, { remote: true });
+          if (fileChanges.aiChangedModel) render('preview');
           if (applied) setSyncState('Synced', 'synced');
         } else if (!hasPendingLocalWorkspaceChanges()) {
           setSyncState('Synced', 'synced');
@@ -1940,6 +2071,8 @@ async function render(mode = 'preview') {
       mode,
       requestId: request.id,
       revision: workspaceRevision,
+      path: activeFile,
+      shareToken: readOnlyToken,
       projection,
       camera,
       view: [$('#edgesToggle').checked && 'edges', $('#axesToggle').checked && 'axes'].filter(Boolean),
@@ -2066,6 +2199,9 @@ async function exportModel(format, scope = 'visible') {
       code: source,
       format,
       revision: workspaceRevision,
+      workspaceId,
+      path: activeFile,
+      shareToken: readOnlyToken,
       ...(objectIds ? { objectIds } : {}),
     };
     let response = await fetch(exportUrl, {
@@ -2255,10 +2391,13 @@ let kickstartDismissed = false;
 
 function updateKickstart() {
   const empty = editor.value.trim().length === 0;
+  // The catalogue replaces a whole model, so it is only offered for an empty one-file workspace,
+  // never over an empty second file the user just made.
+  const blankModel = empty && activeFile === mainFile && workspaceFiles.length <= 1;
   // A read-only view never offers the catalogue. Every card in it either edits
   // this editor or makes a workspace, and neither is a thing a reader came
   // here to do — a shared blank model should just show the blank editor.
-  const hidden = !empty || kickstartDismissed || Boolean(readOnlyToken);
+  const hidden = !blankModel || kickstartDismissed || Boolean(readOnlyToken);
   $('#kickstart').hidden = hidden;
   // Built the first time it is actually shown, so a workspace that opens with
   // code in it never pays for the manifest or the twelve preview requests.
@@ -2266,8 +2405,8 @@ function updateKickstart() {
   // An empty editor has nothing to preview, so the offer to preview it is a
   // button that can only produce an error. The heading beside it still reads
   // as an invitation, which is the right thing for an empty workspace to say.
-  $('#firstPreview').hidden = empty;
-  $('#emptyHint').hidden = empty;
+  $('#firstPreview').hidden = blankModel;
+  $('#emptyHint').hidden = blankModel;
 }
 
 editor.addEventListener('input', () => {
@@ -3380,6 +3519,13 @@ function resolveWorkspaceConflict() {
         setSyncState('Saving', 'saving');
         await saveWorkspace();
       } else {
+        if (activeFile !== mainFile && typeof conflict.activeCode !== 'string') {
+          try {
+            conflict.activeCode = await fetchFileCode(activeFile);
+          } catch (error) {
+            log(error.message, 'error');
+          }
+        }
         applyWorkspace(conflict, { remote: true, force: true });
         setSyncState('Synced', 'synced');
         render('preview');
@@ -3403,6 +3549,376 @@ $('#dismissAiHighlight').addEventListener('click', () => {
   $('#aiRevisionBadge').hidden = true;
   syncEditor(false);
 });
+
+// ---------------------------------------------------------------------------
+// Workspace files: the tab strip above the editor
+// ---------------------------------------------------------------------------
+
+// Folds remote events into the tab state: follows a rename of a file, forgets a deleted one,
+// and marks files other than the open one as changed (their cached text is now stale).
+// Returns what the caller has to act on for the file on screen.
+function noteRemoteFileEvents(events) {
+  const outcome = { touchedActive: false, deletedActive: false, aiChangedModel: false };
+  for (const event of events) {
+    const path = event.path || mainFile;
+    const ai = event.source === 'ai';
+    if (event.kind === 'rename' && event.to) {
+      const buffer = fileBuffers.get(path);
+      if (buffer) { fileBuffers.delete(path); fileBuffers.set(event.to, buffer); }
+      if (filesChangedRemotely.delete(path)) filesChangedRemotely.add(event.to);
+      if (pendingAiRanges.has(path)) {
+        pendingAiRanges.set(event.to, pendingAiRanges.get(path));
+        pendingAiRanges.delete(path);
+      }
+      if (path === activeFile) activeFile = event.to;
+    } else if (event.kind === 'delete') {
+      fileBuffers.delete(path);
+      filesChangedRemotely.delete(path);
+      pendingAiRanges.delete(path);
+      if (path === activeFile) outcome.deletedActive = true;
+    } else if (event.kind === 'setMain') {
+      if (ai) outcome.aiChangedModel = true;
+    } else if (path === activeFile) {
+      outcome.touchedActive = true;
+    } else {
+      // A draft that could not be saved is kept; a clean cached copy is simply re-fetched.
+      const buffer = fileBuffers.get(path);
+      if (buffer && buffer.local !== buffer.saved) buffer.saved = null;
+      else fileBuffers.delete(path);
+      filesChangedRemotely.add(path);
+      if (ai) outcome.aiChangedModel = true;
+      // Events arrive in revision order. A newer AI revision replaces what was held; a
+      // non-AI edit after it means the held ranges no longer describe the text.
+      const revision = Number(event.revision);
+      const pending = pendingAiRanges.get(path);
+      if (!ai) pendingAiRanges.delete(path);
+      else if (pending?.revision === revision) pending.ranges.push(event);
+      else pendingAiRanges.set(path, { revision, ranges: [event] });
+    }
+  }
+  return outcome;
+}
+
+// Runs before `applyWorkspace` on a poll that saw changes. The payload only carries the main
+// file's text, so when another file is open and something changed it, its text is fetched
+// into `payload.activeCode`.
+async function reconcileRemoteFileEvents(payload, since) {
+  const workspace = workspaceFromPayload(payload);
+  const events = (Array.isArray(workspace.updatedRanges) ? workspace.updatedRanges : [])
+    .filter((event) => Number(event.revision) > since);
+  const outcome = noteRemoteFileEvents(events);
+  applyWorkspaceFiles(workspace);
+  if (outcome.deletedActive || !workspaceFiles.includes(activeFile)) {
+    log(`${activeFile} was deleted elsewhere; showing ${mainFile}.`, 'warning');
+    const code = typeof workspace.code === 'string' ? workspace.code : '';
+    showFile(mainFile, code, code);
+    return outcome;
+  }
+  if (activeFile !== mainFile && outcome.touchedActive) {
+    try {
+      payload.activeCode = await fetchFileCode(activeFile);
+    } catch (error) {
+      log(error.message, 'error');
+    }
+  }
+  return outcome;
+}
+
+// After a save the server rebased over other files' edits, picks up the events it skipped.
+async function catchUpOtherFiles(id, generation, from, to) {
+  try {
+    const response = await fetch(`/api/workspaces/${encodeURIComponent(id)}/events?since=${from}`);
+    const payload = await response.json();
+    if (!response.ok || generation !== workspaceGeneration || id !== workspaceId) return;
+    const workspace = workspaceFromPayload(payload);
+    const events = (workspace.updatedRanges || [])
+      .filter((event) => Number(event.revision) > from && Number(event.revision) < to);
+    const outcome = noteRemoteFileEvents(events);
+    applyWorkspaceFiles(workspace);
+    if (outcome.aiChangedModel) render('preview');
+  } catch {
+    // The next change to those files will mark them again.
+  }
+}
+
+// Puts `name` in the editor with its saved and local text. Whatever was on screen has already
+// been saved or stashed by the caller.
+function showFile(name, saved, local = saved) {
+  clearTimeout(workspaceSaveDebounce);
+  workspaceSaveDebounce = null;
+  activeFile = name;
+  fileBuffers.delete(name);
+  filesChangedRemotely.delete(name);
+  applyingRemoteUpdate = true;
+  editor.value = local;
+  workspaceSavedCode = saved;
+  workspaceHasLocalChanges = local !== saved;
+  // An AI edit made while this file was closed is highlighted now, as it would have been had
+  // the file been open. Not over an unsaved draft: the ranges describe the saved text.
+  const pending = pendingAiRanges.get(name);
+  pendingAiRanges.delete(name);
+  aiUpdatedRanges = pending && local === saved ? normalizeUpdatedRanges(local, pending.ranges) : [];
+  $('#aiRevisionBadge').hidden = !aiUpdatedRanges.length;
+  if (aiUpdatedRanges.length) log(`AI updated ${name} (workspace revision ${pending.revision}).`, 'success');
+  dirtyIndicator.classList.toggle('visible', workspaceHasLocalChanges);
+  syncEditor(false);
+  applyingRemoteUpdate = false;
+  editor.scrollTop = 0;
+  editor.setSelectionRange(0, 0);
+  syncScroll();
+  renderFileTabs();
+  storeLocalWorkspace();
+  if (workspaceHasLocalChanges) scheduleWorkspaceSave();
+}
+
+async function openFile(name) {
+  if (name === activeFile || !workspaceFiles.includes(name) || (!workspaceId && !readOnlyToken)) return;
+  if (workspaceConflict) {
+    log('Resolve the source conflict before switching files.', 'warning');
+    return;
+  }
+  const id = workspaceId;
+  const generation = workspaceGeneration;
+  if (id) await flushWorkspaceSave();
+  if (generation !== workspaceGeneration || id !== workspaceId) return;
+  // A read-only view loaded every file up front, so its buffers are always present.
+  let buffer = fileBuffers.get(name);
+  if (!buffer || buffer.saved === null) {
+    try {
+      const saved = await fetchFileCode(name, id);
+      buffer = { saved, local: buffer?.local ?? saved };
+    } catch (error) {
+      log(error.message, 'error');
+      return;
+    }
+    if (generation !== workspaceGeneration || id !== workspaceId) return;
+  }
+  // A draft that could not be saved (it failed validation, say) stays dirty under its tab.
+  fileBuffers.set(activeFile, { saved: workspaceSavedCode, local: editor.value });
+  showFile(name, buffer.saved, buffer.local);
+}
+
+function fileIsDirty(name) {
+  if (name === activeFile) return workspaceHasLocalChanges;
+  const buffer = fileBuffers.get(name);
+  return Boolean(buffer) && buffer.local !== buffer.saved;
+}
+
+function renderFileTabs() {
+  const strip = $('#fileTabs');
+  if (!strip) return;
+  // The main file leads; the rest keep the server's alphabetical order.
+  const ordered = [mainFile, ...workspaceFiles.filter((name) => name !== mainFile)].filter((name) => workspaceFiles.includes(name));
+  strip.innerHTML = ordered.map((name) => {
+    const classes = ['file-tab'];
+    if (name === activeFile) classes.push('active');
+    if (name === mainFile) classes.push('main');
+    if (fileIsDirty(name)) classes.push('dirty');
+    if (filesChangedRemotely.has(name)) classes.push('changed');
+    const title = name === mainFile ? `${name} — the main file, which renders` : name;
+    return `<div class="${classes.join(' ')}" role="tab" aria-selected="${name === activeFile}" data-file="${escapeAttribute(name)}" title="${escapeAttribute(title)}">`
+      + '<span class="file-tab-star" aria-hidden="true">★</span>'
+      + `<button class="file-tab-name" data-file-open>${escapeHtml(name)}</button>`
+      + '<i class="file-tab-dot" aria-hidden="true"></i>'
+      + (readOnlyToken ? '' : `<button class="file-tab-menu" data-file-menu aria-label="Actions for ${escapeAttribute(name)}">⋯</button>`)
+      + '</div>';
+  }).join('') + (readOnlyToken ? '' : '<button class="file-tab-add" data-file-add title="New file" aria-label="New file">+</button>');
+}
+
+function flagFileError(message) {
+  log(message, 'error');
+  const strip = $('#fileTabs');
+  strip.classList.add('error');
+  setTimeout(() => strip.classList.remove('error'), 2400);
+}
+
+// Sends one file operation (create, rename, delete, setMain) as a PATCH. Unlike a source save
+// these need the current revision, so a stale one is reported rather than retried.
+async function workspaceFileOp(body, doing) {
+  if (!workspaceId || readOnlyToken) return null;
+  if (workspaceConflict) {
+    log('Resolve the source conflict before changing files.', 'warning');
+    return null;
+  }
+  const id = workspaceId;
+  const generation = workspaceGeneration;
+  await flushWorkspaceSave();
+  if (generation !== workspaceGeneration || id !== workspaceId) return null;
+  try {
+    const response = await fetch(`/api/workspaces/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, baseRevision: workspaceRevision, source: 'browser' }),
+    });
+    const payload = await response.json();
+    if (generation !== workspaceGeneration || id !== workspaceId) return null;
+    if (!response.ok) {
+      flagFileError(`Could not ${doing}: ${response.status === 409
+        ? 'the workspace changed elsewhere a moment ago; try again.'
+        : payload.error || `the workspace service returned ${response.status}.`}`);
+      return null;
+    }
+    const workspace = workspaceFromPayload(payload);
+    if (Number.isFinite(Number(workspace.revision))) workspaceRevision = Number(workspace.revision);
+    return workspace;
+  } catch (error) {
+    flagFileError(`Could not ${doing}: ${error.message}`);
+    return null;
+  }
+}
+
+const withScadExtension = (value) => (value.endsWith('.scad') ? value : `${value}.scad`);
+
+async function createFile(name) {
+  if (workspaceFiles.includes(name)) { await openFile(name); return; }
+  const workspace = await workspaceFileOp({ path: name, code: '' }, `create ${name}`);
+  if (!workspace) return;
+  fileBuffers.set(name, { saved: '', local: '' });
+  applyWorkspaceFiles(workspace);
+  storeLocalWorkspace();
+  log(`Created ${name}. Reach it from another file with include <${name}> or use <${name}>.`, 'success');
+  await openFile(name);
+}
+
+async function renameFile(name, to) {
+  if (to === name) return;
+  const workspace = await workspaceFileOp({ op: 'rename', path: name, to }, `rename ${name}`);
+  if (!workspace) return;
+  const buffer = fileBuffers.get(name);
+  if (buffer) { fileBuffers.delete(name); fileBuffers.set(to, buffer); }
+  if (activeFile === name) activeFile = to;
+  applyWorkspaceFiles(workspace);
+  storeLocalWorkspace();
+  log(`Renamed ${name} to ${to}.`, 'success');
+}
+
+async function deleteFile(name) {
+  const workspace = await workspaceFileOp({ op: 'delete', path: name }, `delete ${name}`);
+  if (!workspace) return;
+  fileBuffers.delete(name);
+  filesChangedRemotely.delete(name);
+  if (activeFile === name) {
+    const code = typeof workspace.code === 'string' ? workspace.code : '';
+    workspaceHasLocalChanges = false;
+    applyWorkspaceFiles(workspace);
+    showFile(mainFile, code, code);
+  } else {
+    applyWorkspaceFiles(workspace);
+    storeLocalWorkspace();
+  }
+  log(`Deleted ${name}.`, 'success');
+}
+
+async function makeMainFile(name) {
+  const workspace = await workspaceFileOp({ op: 'setMain', path: name }, `make ${name} the main file`);
+  if (!workspace) return;
+  applyWorkspaceFiles(workspace);
+  storeLocalWorkspace();
+  log(`${name} is now the main file.`, 'success');
+  render('preview');
+}
+
+// Swaps a tab's name (or a new tab at the end of the strip) for an input. Enter or leaving
+// the field commits; Escape cancels.
+function editFileName(initial, onCommit, tab = null) {
+  const strip = $('#fileTabs');
+  const holder = tab || Object.assign(document.createElement('div'), { className: 'file-tab active' });
+  if (!tab) strip.insertBefore(holder, strip.querySelector('[data-file-add]'));
+  const input = Object.assign(document.createElement('input'), {
+    className: 'file-tab-input',
+    value: initial,
+    spellcheck: false,
+    ariaLabel: 'File name',
+  });
+  holder.querySelector('.file-tab-name')?.replaceWith(input);
+  if (!tab) holder.append(input);
+  input.focus();
+  input.setSelectionRange(0, initial.endsWith('.scad') ? initial.length - 5 : initial.length);
+  let finished = false;
+  const finish = (commit) => {
+    if (finished) return;
+    finished = true;
+    const value = input.value.trim();
+    renderFileTabs();
+    if (commit && value) onCommit(withScadExtension(value));
+  };
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+    if (event.key === 'Escape') { event.preventDefault(); finish(false); }
+  });
+  // Clicking away keeps what was typed; only Escape throws it away.
+  input.addEventListener('blur', () => finish(true));
+}
+
+let fileMenuTarget = null;
+
+function closeFileMenu() {
+  $('#fileMenu').hidden = true;
+  fileMenuTarget = null;
+}
+
+function openFileMenu(name, anchor) {
+  const menu = $('#fileMenu');
+  fileMenuTarget = name;
+  const isMain = name === mainFile;
+  menu.querySelector('[data-file-action="main"]').disabled = isMain;
+  const remove = menu.querySelector('[data-file-action="delete"]');
+  remove.disabled = isMain;
+  remove.title = isMain ? 'The main file cannot be deleted; make another file main first.' : '';
+  remove.textContent = 'Delete';
+  remove.classList.remove('confirm');
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.min(rect.left, innerWidth - 140)}px`;
+  menu.style.top = `${rect.bottom + 4}px`;
+  menu.hidden = false;
+}
+
+$('#fileTabs').addEventListener('click', (event) => {
+  const tab = event.target.closest('[data-file]');
+  if (event.target.closest('[data-file-add]')) {
+    editFileName('', (name) => createFile(name));
+  } else if (tab && event.target.closest('[data-file-menu]')) {
+    event.stopPropagation();
+    if (fileMenuTarget === tab.dataset.file && !$('#fileMenu').hidden) closeFileMenu();
+    else openFileMenu(tab.dataset.file, event.target.closest('[data-file-menu]'));
+  } else if (tab && event.target.closest('[data-file-open]')) {
+    openFile(tab.dataset.file);
+  }
+});
+$('#fileTabs').addEventListener('dblclick', (event) => {
+  const tab = event.target.closest('[data-file]');
+  if (!tab || !event.target.closest('[data-file-open]') || readOnlyToken) return;
+  const name = tab.dataset.file;
+  editFileName(name, (to) => renameFile(name, to), tab);
+});
+$('#fileMenu').addEventListener('click', (event) => {
+  const action = event.target.closest('[data-file-action]');
+  const name = fileMenuTarget;
+  if (!action || action.disabled || !name) return;
+  event.stopPropagation();
+  if (action.dataset.fileAction === 'delete' && !action.classList.contains('confirm')) {
+    // A second click confirms. Never a native dialog: a modal one freezes the page.
+    action.textContent = `Delete ${name}?`;
+    action.classList.add('confirm');
+    return;
+  }
+  closeFileMenu();
+  if (action.dataset.fileAction === 'rename') {
+    const tab = $(`#fileTabs [data-file="${CSS.escape(name)}"]`);
+    if (tab) editFileName(name, (to) => renameFile(name, to), tab);
+  } else if (action.dataset.fileAction === 'main') {
+    makeMainFile(name);
+  } else if (action.dataset.fileAction === 'delete') {
+    deleteFile(name);
+  }
+});
+document.addEventListener('click', (event) => {
+  if (!$('#fileMenu').hidden && !event.target.closest('#fileMenu')) closeFileMenu();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('#fileMenu').hidden) closeFileMenu();
+});
+renderFileTabs();
 
 const splitter = $('#mainSplitter');
 splitter.addEventListener('pointerdown', (event) => {
@@ -3441,6 +3957,7 @@ async function loadSharedWorkspace(token) {
   workspaceId = null;
   workspaceOnline = false;
   document.body.classList.add('read-only');
+  resetWorkspaceFiles();
   $('#readonlyBanner').hidden = false;
   editor.readOnly = true;
   $('#shareButton').hidden = true;
@@ -3449,7 +3966,19 @@ async function loadSharedWorkspace(token) {
     const response = await fetch(`/api/shared/${encodeURIComponent(token)}`);
     if (!response.ok) throw new Error(`shared ${response.status}`);
     const payload = await response.json();
+    // Every file comes in the payload, so switching tabs here never asks the server.
+    const files = payload.files && typeof payload.files === 'object' ? payload.files : {};
+    if (typeof payload.main === 'string' && typeof files[payload.main] === 'string') {
+      mainFile = payload.main;
+      activeFile = payload.main;
+      workspaceFiles = Object.keys(files).sort();
+      for (const [name, source] of Object.entries(files)) {
+        if (name !== mainFile) fileBuffers.set(name, { saved: source, local: source });
+      }
+      renderFileTabs();
+    }
     editor.value = typeof payload.code === 'string' ? payload.code : '';
+    workspaceSavedCode = editor.value;
     syncEditor(false);
     applyWorkspaceSettings(payload);
     $('#workspaceName').textContent = 'Shared view';
@@ -3476,8 +4005,13 @@ function leaveReadOnly() {
 // permission they do not have.
 $('#forkWorkspace').addEventListener('click', async () => {
   const code = editor.value;
+  const files = Object.fromEntries([
+    ...[...fileBuffers].map(([name, buffer]) => [name, buffer.local]),
+    [activeFile, code],
+  ]);
+  const main = mainFile;
   leaveReadOnly();
-  await createWorkspace(code, { navigation: 'push' });
+  await createWorkspace(code, workspaceFiles.length > 1 ? { navigation: 'push', files, main } : { navigation: 'push' });
   if (editor.value.trim()) render('preview');
 });
 

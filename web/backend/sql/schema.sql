@@ -15,13 +15,25 @@ CREATE TABLE IF NOT EXISTS reopenscad_schema (
     applied_at BIGINT NOT NULL          -- unix milliseconds
 );
 
--- One row per workspace. A workspace is a single SCAD document plus the viewer
--- settings and the recent edit log; the URL containing `id` is the only access
--- control there is, so `id` carries 112 bits of entropy.
+-- One row per workspace. A workspace is a set of SCAD files, one of which
+-- renders, plus the viewer settings and the recent edit log; the URL containing
+-- `id` is the only access control there is, so `id` carries 112 bits of entropy.
 CREATE TABLE IF NOT EXISTS workspaces (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
-    code       TEXT NOT NULL,           -- bounded by MAX_BODY (2 MiB) in the server
+
+    -- `{"name.scad": "source", ...}`, every file including the main one. The
+    -- sources together are bounded by MAX_BODY (2 MiB) in the server. JSONB in
+    -- the row rather than a child table so an edit stays the single-statement
+    -- compare-and-swap described under `revision`.
+    files      JSONB NOT NULL,
+    main       TEXT NOT NULL DEFAULT 'main.scad',   -- the key of `files` that renders
+
+    -- A copy of the main file, kept for builds from before `files` existed
+    -- (rolling deploys and rollbacks). The server writes it and never reads
+    -- it; `workspaces_sync_legacy_code` below carries an older build's writes
+    -- across into `files`.
+    code       TEXT NOT NULL,
 
     -- The optimistic-concurrency token. Every edit is
     --   UPDATE ... SET revision = revision + 1 WHERE id = $1 AND revision = $2
@@ -68,6 +80,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspaces_share_token_idx
 
 CREATE INDEX IF NOT EXISTS workspaces_updated_at_idx
     ON workspaces (updated_at DESC, id DESC);
+
+-- See the comment on `code`. An INSERT without `files`, or an UPDATE that
+-- changes `code` but not `files`, can only come from an older build.
+CREATE OR REPLACE FUNCTION reopenscad_sync_legacy_code() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.files IS NULL THEN
+            NEW.files := jsonb_build_object(NEW.main, NEW.code);
+        END IF;
+    ELSIF NEW.code IS DISTINCT FROM OLD.code
+          AND NEW.files IS NOT DISTINCT FROM OLD.files THEN
+        NEW.files := jsonb_set(NEW.files, ARRAY[NEW.main], to_jsonb(NEW.code));
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS workspaces_sync_legacy_code ON workspaces;
+CREATE TRIGGER workspaces_sync_legacy_code
+    BEFORE INSERT OR UPDATE ON workspaces
+    FOR EACH ROW EXECUTE FUNCTION reopenscad_sync_legacy_code();
 
 INSERT INTO reopenscad_schema (version, applied_at)
 VALUES (1, (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT)

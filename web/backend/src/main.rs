@@ -16,7 +16,7 @@ mod threemf;
 use mcpapp::base64_encode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -39,6 +39,10 @@ const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 /// deadline constants the browser cross-checks stay stable.
 const MAX_CONCURRENT_JOBS: usize = 2;
 const MAX_EVENTS: usize = 64;
+/// Files one workspace may hold, the main one included.
+const MAX_FILES: usize = 32;
+/// Longest accepted file name, `.scad` included.
+const MAX_FILE_NAME: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Denial-of-service guard rails.
@@ -166,7 +170,7 @@ const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
 /// Shared by legacy `initialize` and modern `server/discover` so the two eras
 /// describe the server identically.
-const MCP_INSTRUCTIONS: &str = "Create and edit single-file SCAD workspaces, then render or export them. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of the source in a local .scad file and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
+const MCP_INSTRUCTIONS: &str = "Create and edit SCAD workspaces, then render or export them. A workspace holds up to 32 .scad files; its main file is the one that renders, and `include <name.scad>` / `use <name.scad>` reach the other files by exact name (the bundled units.scad and shapes.scad are also available). Create a file by sending `code` for a new `path` to update_workspace_code, and delete, rename or change the main file with its `op`. Workspaces do not expire, but a deployment holds a bounded number of them and evicts the least recently touched when it is full, so keep the authoritative copy of every file locally and treat the workspace as a surface you can recreate. Workspace URLs are access capabilities: anyone holding the link has full read/write, so do not post them anywhere public. A workspace can also carry a separate read-only link, minted in the browser under Share; that link cannot be turned back into the editable one, and there is no MCP tool that creates or resolves one. Read ui://reopenscad/workspace/{workspaceId} for an embedded 3D preview app with STL and 3MF downloads.";
 
 #[derive(Clone)]
 struct AppState {
@@ -222,7 +226,21 @@ struct Workspace {
     id: String,
     #[serde(default = "default_workspace_name")]
     name: String,
-    code: String,
+    /// The file that renders; a key of `files`.
+    #[serde(default = "default_main_file")]
+    main: String,
+    /// Every source file, the main one included, by name.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    /// The single `code` field documents had before `files` existed.
+    ///
+    /// Read only so [`Workspace::adopt_legacy_code`] can upgrade such a
+    /// document. It is still *written* — as a copy of the main file, by
+    /// `persist` — because a build from before `files` reads `code`, and
+    /// `load` deletes any document it cannot parse: switching back to an older
+    /// build must not destroy every workspace on disk.
+    #[serde(default, rename = "code", skip_serializing)]
+    legacy_code: String,
     revision: u64,
     created_at: u64,
     updated_at: u64,
@@ -271,15 +289,57 @@ struct WorkspaceEvent {
     workspace_id: String,
     revision: u64,
     source: String,
+    /// The file the event happened to. Empty on events logged before
+    /// workspaces had files, all of which were edits to the main file.
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    kind: EventKind,
+    /// The new name, on a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    /// The replaced byte range of `path` and the length of its replacement.
+    /// Zero for everything but an edit.
     start: usize,
     end: usize,
     inserted_length: usize,
     timestamp: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum EventKind {
+    #[default]
+    Edit,
+    Create,
+    Delete,
+    Rename,
+    SetMain,
+}
+
+/// What a PATCH does to its `path`. Absent means an edit, which is also how a
+/// file is created: replacing the `code` of a name that does not exist yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum FileOp {
+    #[default]
+    Edit,
+    Delete,
+    Rename,
+    SetMain,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceUpdate {
+    /// The file to act on; the main file when absent.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    op: FileOp,
+    /// The new name, for a rename.
+    #[serde(default)]
+    to: Option<String>,
     code: Option<String>,
     name: Option<String>,
     start: Option<usize>,
@@ -303,6 +363,370 @@ struct EditResult {
 
 fn default_workspace_name() -> String {
     "Untitled model".into()
+}
+
+fn default_main_file() -> String {
+    engine::DEFAULT_MAIN_FILE.into()
+}
+
+impl Workspace {
+    /// The source of the file that renders.
+    fn main_code(&self) -> &str {
+        self.files.get(&self.main).map_or("", String::as_str)
+    }
+
+    /// Everything a compile of this workspace can see.
+    fn project(&self) -> engine::Project {
+        engine::Project {
+            main: self.main.clone(),
+            files: self.files.clone(),
+        }
+    }
+
+    /// Moves a pre-`files` document's `code` into `files`.
+    fn adopt_legacy_code(&mut self) {
+        let code = std::mem::take(&mut self.legacy_code);
+        if self.files.is_empty() {
+            self.files.insert(self.main.clone(), code);
+        }
+    }
+}
+
+/// A workspace as written to disk: the document plus the legacy `code` copy
+/// described on [`Workspace::legacy_code`].
+#[derive(Serialize)]
+struct PersistedWorkspace<'a> {
+    #[serde(flatten)]
+    workspace: &'a Workspace,
+    code: &'a str,
+}
+
+/// The files a fresh workspace holding `code` starts with.
+#[cfg(test)]
+fn single_file(code: String) -> BTreeMap<String, String> {
+    BTreeMap::from([(engine::DEFAULT_MAIN_FILE.to_string(), code)])
+}
+
+fn total_source_bytes(files: &BTreeMap<String, String>) -> usize {
+    files.values().map(String::len).sum()
+}
+
+/// What an accepted edit turns the workspace into, and the event fields
+/// describing it. Shared by both stores so they cannot disagree on what an
+/// edit means.
+struct PlannedEdit {
+    main: String,
+    files: BTreeMap<String, String>,
+    path: String,
+    kind: EventKind,
+    to: Option<String>,
+    start: usize,
+    end: usize,
+    inserted_length: usize,
+}
+
+/// Whether `name` may name a workspace file: a plain `.scad` file name, with
+/// no directory and nothing a path could be built from.
+/// Whether an edit made against `expected` can still be applied to `current`.
+///
+/// The revision is workspace-wide, so without this an agent editing
+/// `parts.scad` would make the browser's in-flight save of `main.scad` fail.
+/// An edit is safe to apply over a newer revision when every change since its
+/// base is still in the log and was an edit or create of a *different* file:
+/// the text it was computed against is then exactly the text it lands on, and
+/// the result is validated against the current project as usual. Structural
+/// changes (delete, rename, setMain) and anything older than the log always
+/// conflict.
+fn rebase_allowed(current: &Workspace, expected: u64, update: &WorkspaceUpdate) -> bool {
+    if update.op != FileOp::Edit || expected >= current.revision {
+        return false;
+    }
+    let target = update.path.as_deref().unwrap_or(&current.main);
+    let since = current
+        .events
+        .iter()
+        .filter(|event| event.revision > expected)
+        .collect::<Vec<_>>();
+    since.len() as u64 == current.revision - expected
+        && since.iter().all(|event| {
+            // Events from before files existed carry no path: main-file edits.
+            let path = if event.path.is_empty() {
+                current.main.as_str()
+            } else {
+                event.path.as_str()
+            };
+            matches!(event.kind, EventKind::Edit | EventKind::Create) && path != target
+        })
+}
+
+impl PlannedEdit {
+    fn event(&self, workspace_id: &str, revision: u64, source: &str, now: u64) -> WorkspaceEvent {
+        WorkspaceEvent {
+            workspace_id: workspace_id.to_string(),
+            revision,
+            source: normalize_source(source),
+            path: self.path.clone(),
+            kind: self.kind,
+            to: self.to.clone(),
+            start: self.start,
+            end: self.end,
+            inserted_length: self.inserted_length,
+            timestamp: now,
+        }
+    }
+}
+
+fn valid_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".scad") else {
+        return false;
+    };
+    name.len() <= MAX_FILE_NAME
+        && stem
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !stem.contains("..")
+}
+
+/// The files a create request asks for: either `code`, which becomes the
+/// main file of a one-file workspace, or `files` (name to source) with an
+/// optional `main`. `main` may be omitted when the files include `main.scad`
+/// or there is only one file. Held to the same name, count, size and
+/// validation rules as files saved by an edit.
+fn initial_project(input: &Value) -> Result<engine::Project, UpdateError> {
+    let Some(files) = input.get("files") else {
+        let code = input
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_SOURCE);
+        let project = engine::Project::single(code);
+        if total_source_bytes(&project.files) > MAX_BODY {
+            return Err(UpdateError::Invalid(
+                "Workspace code exceeds the 2 MiB limit.".into(),
+            ));
+        }
+        validate_source(&project).map_err(UpdateError::Validation)?;
+        return Ok(project);
+    };
+    if input.get("code").is_some() {
+        return Err(UpdateError::Invalid(
+            "Send either `code` or `files`, not both.".into(),
+        ));
+    }
+    let files = files
+        .as_object()
+        .ok_or_else(|| UpdateError::Invalid("`files` must map file names to sources.".into()))?
+        .iter()
+        .map(|(name, source)| {
+            let source = source.as_str().ok_or_else(|| {
+                UpdateError::Invalid(format!("The source of {name:?} must be a string."))
+            })?;
+            if !valid_file_name(name) {
+                return Err(file_name_error(name));
+            }
+            Ok((name.clone(), source.to_string()))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if files.is_empty() {
+        return Err(UpdateError::Invalid("`files` must hold at least one file.".into()));
+    }
+    if files.len() > MAX_FILES {
+        return Err(UpdateError::Invalid(format!(
+            "A workspace holds at most {MAX_FILES} files."
+        )));
+    }
+    if total_source_bytes(&files) > MAX_BODY {
+        return Err(UpdateError::Invalid(
+            "Workspace code exceeds the 2 MiB limit.".into(),
+        ));
+    }
+    let main = match input.get("main").and_then(Value::as_str) {
+        Some(main) if files.contains_key(main) => main.to_string(),
+        Some(main) => return Err(missing_file_error(main)),
+        None if files.contains_key(engine::DEFAULT_MAIN_FILE) => default_main_file(),
+        None if files.len() == 1 => files.keys().next().cloned().unwrap_or_default(),
+        None => {
+            return Err(UpdateError::Invalid(
+                "Name the file that renders with `main`.".into(),
+            ))
+        }
+    };
+    let mut project = engine::Project { main, files };
+    validate_source(&project).map_err(UpdateError::Validation)?;
+    // Every other file must also validate on its own, as it would have to if
+    // it were saved later by an edit (see `plan_edit`).
+    let main = std::mem::take(&mut project.main);
+    let others = project
+        .files
+        .keys()
+        .filter(|name| **name != main)
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in others {
+        project.main = name;
+        validate_source(&project)
+            .map_err(|error| UpdateError::Validation(format!("{}: {error}", project.main)))?;
+    }
+    project.main = main;
+    Ok(project)
+}
+
+fn file_name_error(name: &str) -> UpdateError {
+    UpdateError::Invalid(format!(
+        "{name:?} is not a valid file name. Use letters, digits, '_', '-' and '.', start with \
+         a letter or digit, end in .scad, and keep it to {MAX_FILE_NAME} characters."
+    ))
+}
+
+fn missing_file_error(name: &str) -> UpdateError {
+    UpdateError::Invalid(format!("No file named {name:?} in this workspace."))
+}
+
+/// Applies `update` to `current` and validates the result as a whole
+/// project, since a change to one file can break a file that includes it.
+///
+/// The main file must still validate afterwards, and a file that was edited
+/// or created must also validate on its own, so a syntax error in a file
+/// nothing includes yet is still caught when it is saved.
+fn plan_edit(
+    current: &Workspace,
+    update: &mut WorkspaceUpdate,
+) -> Result<PlannedEdit, UpdateError> {
+    let path = update.path.take().unwrap_or_else(|| current.main.clone());
+    let mut main = current.main.clone();
+    let mut files = current.files.clone();
+    let mut to = None;
+    let (kind, start, end, inserted_length) = match update.op {
+        FileOp::Edit => {
+            let existing = files.get(&path);
+            let (code, start, end, inserted_length) = if let Some(code) = update.code.take() {
+                let old_len = existing.map_or(0, String::len);
+                let new_len = code.len();
+                (code, 0, old_len, new_len)
+            } else {
+                let existing = existing.ok_or_else(|| {
+                    UpdateError::Invalid(format!(
+                        "No file named {path:?} in this workspace. Send `code` to create it."
+                    ))
+                })?;
+                let start = update.start.ok_or_else(|| {
+                    UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+                })?;
+                let end = update.end.ok_or_else(|| {
+                    UpdateError::Invalid("Provide code or a start/end/text edit.".into())
+                })?;
+                let text = update.text.take().unwrap_or_default();
+                if start > end
+                    || end > existing.len()
+                    || !existing.is_char_boundary(start)
+                    || !existing.is_char_boundary(end)
+                {
+                    return Err(UpdateError::Invalid(
+                        "Edit range must use valid UTF-8 byte offsets within the document."
+                            .into(),
+                    ));
+                }
+                let mut code = existing.clone();
+                code.replace_range(start..end, &text);
+                (code, start, end, text.len())
+            };
+            let kind = if files.contains_key(&path) {
+                EventKind::Edit
+            } else {
+                if !valid_file_name(&path) {
+                    return Err(file_name_error(&path));
+                }
+                if files.len() >= MAX_FILES {
+                    return Err(UpdateError::Invalid(format!(
+                        "A workspace holds at most {MAX_FILES} files."
+                    )));
+                }
+                EventKind::Create
+            };
+            files.insert(path.clone(), code);
+            (kind, start, end, inserted_length)
+        }
+        op => {
+            if update.code.is_some()
+                || update.start.is_some()
+                || update.end.is_some()
+                || update.text.is_some()
+            {
+                return Err(UpdateError::Invalid(
+                    "A delete, rename or setMain carries no code or range.".into(),
+                ));
+            }
+            if !files.contains_key(&path) {
+                return Err(missing_file_error(&path));
+            }
+            match op {
+                FileOp::Delete => {
+                    if path == main {
+                        return Err(UpdateError::Invalid(
+                            "The main file cannot be deleted; make another file main first."
+                                .into(),
+                        ));
+                    }
+                    let removed = files.remove(&path).unwrap_or_default();
+                    (EventKind::Delete, 0, removed.len(), 0)
+                }
+                FileOp::Rename => {
+                    let target = update.to.take().ok_or_else(|| {
+                        UpdateError::Invalid("A rename needs `to`, the new name.".into())
+                    })?;
+                    if !valid_file_name(&target) {
+                        return Err(file_name_error(&target));
+                    }
+                    if files.contains_key(&target) {
+                        return Err(UpdateError::Invalid(format!(
+                            "A file named {target:?} already exists."
+                        )));
+                    }
+                    let source = files.remove(&path).unwrap_or_default();
+                    files.insert(target.clone(), source);
+                    if path == main {
+                        main = target.clone();
+                    }
+                    to = Some(target);
+                    (EventKind::Rename, 0, 0, 0)
+                }
+                FileOp::SetMain => {
+                    main = path.clone();
+                    (EventKind::SetMain, 0, 0, 0)
+                }
+                FileOp::Edit => unreachable!("handled above"),
+            }
+        }
+    };
+    if total_source_bytes(&files) > MAX_BODY {
+        return Err(UpdateError::Invalid(
+            "Workspace code exceeds the 2 MiB limit.".into(),
+        ));
+    }
+    let mut project = engine::Project {
+        main: main.clone(),
+        files,
+    };
+    validate_source(&project).map_err(UpdateError::Validation)?;
+    if matches!(kind, EventKind::Edit | EventKind::Create) && path != main {
+        project.main = path.clone();
+        validate_source(&project)
+            .map_err(|error| UpdateError::Validation(format!("{path}: {error}")))?;
+        project.main = main.clone();
+    }
+    Ok(PlannedEdit {
+        main,
+        files: project.files,
+        path,
+        kind,
+        to,
+        start,
+        end,
+        inserted_length,
+    })
 }
 
 fn default_edit_source() -> String {
@@ -549,7 +973,10 @@ impl WorkspaceStore {
             Err(error) => return Err(format!("Workspace could not be read: {error}")),
         };
         let workspace = match serde_json::from_slice::<Workspace>(&bytes) {
-            Ok(workspace) if workspace.id == id => workspace,
+            Ok(mut workspace) if workspace.id == id => {
+                workspace.adopt_legacy_code();
+                workspace
+            }
             _ => {
                 self.forget(inner, id);
                 return Ok(None);
@@ -571,12 +998,13 @@ impl WorkspaceStore {
     /// a brand new workspace.
     fn create_with_settings(
         &self,
-        code: String,
+        source: impl Into<engine::Project>,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
     ) -> Result<Workspace, String> {
-        if code.len() > MAX_BODY {
+        let project = source.into();
+        if total_source_bytes(&project.files) > MAX_BODY {
             return Err("Workspace code exceeds the 2 MiB limit.".into());
         }
         let now = unix_millis();
@@ -596,7 +1024,9 @@ impl WorkspaceStore {
             share_token: String::new(),
             id: id.clone(),
             name: sanitize_name(name),
-            code,
+            main: project.main,
+            files: project.files,
+            legacy_code: String::new(),
             revision: 1,
             created_at: now,
             updated_at: now,
@@ -624,7 +1054,7 @@ impl WorkspaceStore {
         self.inner.lock().map(|inner| inner.index.len()).unwrap_or(0)
     }
 
-    fn update(&self, id: &str, update: WorkspaceUpdate) -> Result<EditResult, UpdateError> {
+    fn update(&self, id: &str, mut update: WorkspaceUpdate) -> Result<EditResult, UpdateError> {
         let expected = update
             .expected_revision
             .or(update.base_revision)
@@ -642,41 +1072,10 @@ impl WorkspaceStore {
                     .map_err(UpdateError::Internal)
             })?
             .ok_or(UpdateError::NotFound)?;
-        if expected != current.revision {
-            return Err(UpdateError::Conflict(current));
+        if expected != current.revision && !rebase_allowed(&current, expected, &update) {
+            return Err(UpdateError::Conflict(Box::new(current)));
         }
-        let (code, start, end, inserted_length) = if let Some(code) = update.code {
-            let old_len = current.code.len();
-            let new_len = code.len();
-            (code, 0, old_len, new_len)
-        } else {
-            let start = update.start.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let end = update.end.ok_or_else(|| {
-                UpdateError::Invalid("Provide code or a start/end/text edit.".into())
-            })?;
-            let text = update.text.unwrap_or_default();
-            if start > end
-                || end > current.code.len()
-                || !current.code.is_char_boundary(start)
-                || !current.code.is_char_boundary(end)
-            {
-                return Err(UpdateError::Invalid(
-                    "Edit range must use valid UTF-8 byte offsets within the document.".into(),
-                ));
-            }
-            let mut code = current.code.clone();
-            code.replace_range(start..end, &text);
-            let inserted_length = text.len();
-            (code, start, end, inserted_length)
-        };
-        if code.len() > MAX_BODY {
-            return Err(UpdateError::Invalid(
-                "Workspace code exceeds the 2 MiB limit.".into(),
-            ));
-        }
-        validate_source(&code).map_err(UpdateError::Validation)?;
+        let planned = plan_edit(&current, &mut update)?;
         let mut inner = self
             .inner
             .lock()
@@ -685,21 +1084,17 @@ impl WorkspaceStore {
             .load(&mut inner, id)
             .map_err(UpdateError::Internal)?
             .ok_or(UpdateError::NotFound)?;
-        if latest.revision != expected {
-            return Err(UpdateError::Conflict(latest));
+        // Compared with what was planned against, not with `expected`: a
+        // rebased edit was validated against `current`, and anything newer
+        // has not been looked at.
+        if latest.revision != current.revision {
+            return Err(UpdateError::Conflict(Box::new(latest)));
         }
         let now = unix_millis();
-        let event = WorkspaceEvent {
-            workspace_id: id.to_string(),
-            revision: current.revision + 1,
-            source: normalize_source(&update.source),
-            start,
-            end,
-            inserted_length,
-            timestamp: now,
-        };
+        let event = planned.event(id, current.revision + 1, &update.source, now);
         let mut workspace = latest;
-        workspace.code = code;
+        workspace.main = planned.main;
+        workspace.files = planned.files;
         if let Some(name) = update.name {
             workspace.name = sanitize_name(Some(name));
         }
@@ -787,7 +1182,11 @@ impl WorkspaceStore {
             workspace.id,
             self.nonce.fetch_add(1, Ordering::Relaxed)
         ));
-        let bytes = serde_json::to_vec_pretty(workspace).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&PersistedWorkspace {
+            workspace,
+            code: workspace.main_code(),
+        })
+        .map_err(|error| error.to_string())?;
         let result = (|| -> io::Result<()> {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -864,21 +1263,17 @@ enum Store {
 }
 
 impl Store {
-    fn create(&self, code: String, name: Option<String>) -> Result<Workspace, String> {
-        self.create_with_settings(code, name, None, None)
-    }
-
     fn create_with_settings(
         &self,
-        code: String,
+        source: impl Into<engine::Project>,
         name: Option<String>,
         plate: Option<String>,
         tolerance: Option<f64>,
     ) -> Result<Workspace, String> {
         match self {
-            Self::Filesystem(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Filesystem(store) => store.create_with_settings(source, name, plate, tolerance),
             #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.create_with_settings(code, name, plate, tolerance),
+            Self::Postgres(store) => store.create_with_settings(source, name, plate, tolerance),
         }
     }
 
@@ -986,7 +1381,7 @@ fn open_postgres_store(_url: &str) -> io::Result<Store> {
 #[derive(Debug)]
 enum UpdateError {
     NotFound,
-    Conflict(Workspace),
+    Conflict(Box<Workspace>),
     Invalid(String),
     Validation(String),
     Internal(String),
@@ -1038,7 +1433,7 @@ fn valid_workspace_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn validate_source(source: &str) -> Result<(), String> {
+fn validate_source(source: impl Into<engine::Project>) -> Result<(), String> {
     engine::validate(source)
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -2046,7 +2441,7 @@ impl Drop for RenderDeadline {
 
 /// [`engine::compile`] under the deadline for its quality.
 fn compile_guarded(
-    source: &str,
+    source: impl Into<engine::Project>,
     quality: engine::Quality,
 ) -> Result<Arc<engine::CompileOutput>, String> {
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -2057,7 +2452,7 @@ fn compile_guarded(
 
 /// [`engine::compile_parts`] under the deadline for its quality.
 fn compile_parts_guarded(
-    source: &str,
+    source: impl Into<engine::Project>,
     quality: engine::Quality,
 ) -> Result<Arc<engine::MultipartCompileOutput>, String> {
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -2810,14 +3205,12 @@ fn handle_create_workspace(
         Ok(value) => value,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let code = input
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SOURCE)
-        .to_string();
-    if let Err(error) = validate_source(&code) {
-        return respond_validation_error(stream, error);
-    }
+    let project = match initial_project(&input) {
+        Ok(project) => project,
+        Err(UpdateError::Validation(error)) => return respond_validation_error(stream, error),
+        Err(UpdateError::Invalid(error)) => return respond_error(stream, 400, &error),
+        Err(_) => return respond_error(stream, 400, "Invalid workspace."),
+    };
     let name = input
         .get("name")
         .and_then(Value::as_str)
@@ -2831,7 +3224,7 @@ fn handle_create_workspace(
     let tolerance = input.get("tolerance").and_then(Value::as_f64);
     match state
         .workspaces
-        .create_with_settings(code, name, plate, tolerance)
+        .create_with_settings(project, name, plate, tolerance)
     {
         Ok(workspace) => respond_workspace(stream, 201, state, request, &workspace, None),
         Err(error) => respond_error(stream, 500, &error),
@@ -2899,6 +3292,9 @@ fn handle_update_workspace(
         && update.start.is_none()
         && update.end.is_none()
         && update.text.is_none()
+        && update.path.is_none()
+        && update.op == FileOp::Edit
+        && update.to.is_none()
         && (update.plate.is_some() || update.tolerance.is_some())
     {
         return match state
@@ -2957,9 +3353,10 @@ fn handle_query_workspace_code(
         Err(error) => return respond_error(stream, 500, &error),
     };
     let parameters = query_parameters(&request.query);
-    let start = query_usize(&parameters, "start").unwrap_or(0);
-    let end = query_usize(&parameters, "end").unwrap_or(workspace.code.len());
-    match workspace_code_slice(&workspace, start, end) {
+    let path = parameters.get("path").map(String::as_str);
+    let start = query_usize(&parameters, "start");
+    let end = query_usize(&parameters, "end");
+    match workspace_code_slice(&workspace, path, start, end) {
         Ok(payload) => respond_value(stream, 200, &payload),
         Err(error) => respond_error(stream, 400, &error),
     }
@@ -2999,7 +3396,12 @@ fn handle_shared_workspace(
             &json!({
                 "ok": true,
                 "readOnly": true,
-                "code": workspace.code,
+                "code": workspace.main_code(),
+                // Every file in full: a reader may see all of them, and the
+                // 2 MiB cap bounds the payload, so the read-only view needs no
+                // token-scoped reader of its own.
+                "main": workspace.main,
+                "files": workspace.files,
                 "revision": workspace.revision,
                 "plate": workspace.plate,
                 "tolerance": workspace.tolerance,
@@ -3114,11 +3516,24 @@ fn is_safe_preview_data_url(value: &str) -> bool {
 /// The partial-read payload shared by `GET /api/workspaces/{id}/code` and the
 /// `get_workspace_code` MCP tool, so the two can never disagree about which
 /// byte ranges are legal or what a slice reply looks like.
-fn workspace_code_slice(workspace: &Workspace, start: usize, end: usize) -> Result<Value, String> {
+/// A byte range of one file, the main one unless `path` names another.
+fn workspace_code_slice(
+    workspace: &Workspace,
+    path: Option<&str>,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<Value, String> {
+    let path = path.unwrap_or(&workspace.main);
+    let source = workspace
+        .files
+        .get(path)
+        .ok_or_else(|| format!("No file named {path:?} in this workspace."))?;
+    let start = start.unwrap_or(0);
+    let end = end.unwrap_or(source.len());
     if start > end
-        || end > workspace.code.len()
-        || !workspace.code.is_char_boundary(start)
-        || !workspace.code.is_char_boundary(end)
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
     {
         return Err("Range must use valid UTF-8 byte offsets within the document.".into());
     }
@@ -3126,11 +3541,23 @@ fn workspace_code_slice(workspace: &Workspace, start: usize, end: usize) -> Resu
         "ok": true,
         "workspaceId": workspace.id,
         "revision": workspace.revision,
+        "path": path,
+        "main": workspace.main,
         "start": start,
         "end": end,
-        "totalLength": workspace.code.len(),
-        "code": &workspace.code[start..end]
+        "totalLength": source.len(),
+        "code": &source[start..end]
     }))
+}
+
+/// The workspace's files by name and size, without their contents, which
+/// `code` (the main file) and the ranged reader serve.
+fn workspace_file_summaries(workspace: &Workspace) -> Vec<Value> {
+    workspace
+        .files
+        .iter()
+        .map(|(name, source)| json!({"name": name, "bytes": source.len()}))
+        .collect()
 }
 
 fn handle_workspace_events(
@@ -3212,7 +3639,9 @@ fn workspace_events_payload(id: &str, workspace: &Workspace, since: u64) -> Valu
         "tolerance": workspace.tolerance
     });
     if changed {
-        payload["code"] = json!(workspace.code);
+        payload["code"] = json!(workspace.main_code());
+        payload["main"] = json!(workspace.main);
+        payload["files"] = json!(workspace_file_summaries(workspace));
     }
     payload
 }
@@ -3283,7 +3712,7 @@ fn handle_workspace_render(
     // is the difference between a queue and a slow rejection.
     let started = Instant::now();
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    let compiled = match engine::compile_parts_shared(&workspace.code, quality, Some(&cancellation))
+    let compiled = match engine::compile_parts_shared(workspace.project(), quality, Some(&cancellation))
     {
         Ok(compiled) => compiled,
         Err(error) if deadline.expired() => {
@@ -3464,7 +3893,7 @@ fn handle_workspace_intersections(
         Ok(permit) => permit,
         Err(rejection) => return respond_queue_rejection(stream, rejection),
     };
-    let compiled = match compile_parts_guarded(&workspace.code, engine::Quality::Preview) {
+    let compiled = match compile_parts_guarded(workspace.project(), engine::Quality::Preview) {
         Ok(compiled) => compiled,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -3659,7 +4088,7 @@ fn handle_workspace_export(
     if !is_supported_export_format(format.as_str()) {
         return respond_error(stream, 400, &supported_export_formats_sentence());
     }
-    let selected_mesh = match export_mesh(&workspace.code, object_ids.as_deref()) {
+    let selected_mesh = match export_mesh(workspace.project(), object_ids.as_deref()) {
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -3740,7 +4169,10 @@ fn export_content_type(format: &str) -> &'static str {
 
 // Both export endpoints share this: no object IDs means the whole model, and an ID filter is
 // only meaningful against parts compiled at export quality.
-fn export_mesh(source: &str, object_ids: Option<&[String]>) -> Result<engine::Mesh, String> {
+fn export_mesh(
+    source: impl Into<engine::Project>,
+    object_ids: Option<&[String]>,
+) -> Result<engine::Mesh, String> {
     let Some(object_ids) = object_ids else {
         return compile_guarded(source, engine::Quality::Render).map(|output| output.mesh.clone());
     };
@@ -3806,7 +4238,9 @@ fn workspace_public(
     json!({
         "id": workspace.id,
         "name": workspace.name,
-        "code": workspace.code,
+        "code": workspace.main_code(),
+        "main": workspace.main,
+        "files": workspace_file_summaries(workspace),
         "revision": workspace.revision,
         "createdAt": workspace.created_at,
         "updatedAt": workspace.updated_at,
@@ -4530,7 +4964,7 @@ fn mcp_read_resource(state: &AppState, request: &Request, uri: &str) -> Result<V
         .render_queue
         .acquire(current_client_key(), None, None)
         .map_err(QueueRejection::message)?;
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_parts_guarded(workspace.project(), engine::Quality::Preview)?;
     let preview = mcpapp::encode_preview(&compiled.mesh);
     let html = mcpapp::viewer_html(
         id,
@@ -4557,16 +4991,28 @@ fn mcp_tool_definitions() -> Vec<Value> {
     vec![
         mcp_tool(
             "create_workspace",
-            "Create a single-file SCAD workspace and return its browser URL. \
-             The workspace does not expire, but a deployment holds a bounded number of them and \
-             evicts the least recently touched one when it is full, so save the SCAD source to a \
-             local .scad file (for example alongside the user's project) and treat that file as \
-             the source of truth. The returned URL is an access capability: anyone with the link \
-             can read and change the work, so share it deliberately and never post it publicly.",
+            "Create a SCAD workspace and return its browser URL. Pass `code` for a one-file \
+             workspace (its file is main.scad), or `files` to upload a multi-file project in one \
+             call, e.g. {\"files\": {\"main.scad\": \"include <params.scad>\\ncube(size);\", \
+             \"params.scad\": \"size = 10;\"}}. The whole project is validated before it is \
+             created. The workspace does not expire, but a deployment holds a bounded number of \
+             them and evicts the least recently touched one when it is full, so save every file \
+             locally (for example alongside the user's project) and treat those files as the \
+             source of truth. The returned URL is an access capability: anyone with the link can \
+             read and change the work, so share it deliberately and never post it publicly.",
             json!({
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Initial SCAD source."},
+                    "code": {"type": "string", "description": "Initial SCAD source of a one-file workspace."},
+                    "files": {
+                        "type": "object",
+                        "description": "File name to SCAD source, instead of `code`. Names are plain .scad file names without directories.",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "main": {
+                        "type": "string",
+                        "description": "Which of `files` renders. Optional when the files include main.scad or there is only one."
+                    },
                     "name": {"type": "string"}
                 }
             }),
@@ -4578,12 +5024,15 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "get_workspace_code",
-            "Read all or a UTF-8 byte range of workspace source to minimize token usage.",
+            "Read all or a UTF-8 byte range of one workspace file to minimize token usage. \
+             `path` names the file; the main file is read when it is omitted. \
+             list_workspace_objects and get_workspace_link list the files.",
             json!({
                 "type": "object",
                 "required": ["workspaceId"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string"},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0}
                 }
@@ -4591,12 +5040,24 @@ fn mcp_tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "update_workspace_code",
-            "Validate and atomically replace source or apply one partial UTF-8 byte-range edit.",
+            "Change one workspace file and bump the revision. `path` names the file (default: \
+             the main file). With the default op, send `code` to replace the file — or create \
+             it, if no file has that name — or start/end/text for one UTF-8 byte-range edit. \
+             op `delete` removes `path` (not the main file), `rename` moves it to `to` (the main \
+             file stays main under its new name), and `setMain` makes it the file that renders. \
+             Names are plain .scad file names without directories, at most 32 files per \
+             workspace. Every change is validated as a whole project, so deleting or renaming a \
+             file that another file still includes is refused. An edit whose expectedRevision is \
+             stale is still accepted when every change since then only edited other files; a \
+             delete, rename or setMain always needs the current revision.",
             json!({
                 "type": "object",
                 "required": ["workspaceId", "expectedRevision"],
                 "properties": {
                     "workspaceId": {"type": "string"},
+                    "path": {"type": "string"},
+                    "op": {"type": "string", "enum": ["edit", "delete", "rename", "setMain"]},
+                    "to": {"type": "string"},
                     "code": {"type": "string"},
                     "start": {"type": "integer", "minimum": 0},
                     "end": {"type": "integer", "minimum": 0},
@@ -4777,18 +5238,19 @@ fn mcp_create_workspace(
     // The compute permit for this tool is taken by `mcp_call_tool`, which is
     // the only place that can turn a refusal into a tool result an agent can
     // act on.
-    let code = arguments
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_SOURCE)
-        .to_string();
-    validate_source(&code).map_err(|error| format!("SCAD validation failed: {error}"))?;
+    let project = initial_project(arguments).map_err(|error| match error {
+        UpdateError::Validation(error) => format!("SCAD validation failed: {error}"),
+        UpdateError::Invalid(error) | UpdateError::Internal(error) => error,
+        UpdateError::NotFound | UpdateError::Conflict(_) => "Invalid workspace.".into(),
+    })?;
     let name = arguments
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let workspace = state.workspaces.create(code, name)?;
-    let objects = workspace_object_summaries(&workspace.code);
+    let workspace = state
+        .workspaces
+        .create_with_settings(project, name, None, None)?;
+    let objects = workspace_object_summaries(workspace.project());
     Ok(json!({
         "ok": true,
         "workspace": workspace_public(&workspace, state, request, None, Some(objects)),
@@ -4802,12 +5264,16 @@ fn mcp_get_workspace_code(state: &AppState, arguments: &Value) -> Result<Value, 
         .workspaces
         .get(id)?
         .ok_or_else(|| "Workspace not found.".to_string())?;
-    let start = arguments.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let path = arguments.get("path").and_then(Value::as_str);
+    let start = arguments
+        .get("start")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
     let end = arguments
         .get("end")
         .and_then(Value::as_u64)
-        .unwrap_or(workspace.code.len() as u64) as usize;
-    workspace_code_slice(&workspace, start, end)
+        .map(|value| value as usize);
+    workspace_code_slice(&workspace, path, start, end)
 }
 
 fn mcp_update_workspace(
@@ -4826,7 +5292,7 @@ fn mcp_update_workspace(
         serde_json::from_value(arguments).map_err(|error| format!("Invalid update: {error}"))?;
     match state.workspaces.update(&id, update) {
         Ok(result) => {
-            let objects = workspace_object_summaries(&result.workspace.code);
+            let objects = workspace_object_summaries(result.workspace.project());
             Ok(json!({
                 "ok": true,
                 "valid": true,
@@ -4884,7 +5350,7 @@ fn mcp_render_workspace(
     }
     let object_ids = requested_object_ids(arguments, &HashMap::new())?;
     // Permit held by `mcp_call_tool`.
-    let output = compile_parts_guarded(&workspace.code, engine::Quality::Render)?;
+    let output = compile_parts_guarded(workspace.project(), engine::Quality::Render)?;
     if multipart_binary_size(&output).is_none_or(|size| size > MAX_OUTPUT) {
         return Err("Aggregate multipart mesh output exceeds the 64 MiB limit.".into());
     }
@@ -4938,7 +5404,7 @@ fn workspace_export_url(
 /// Used on write paths where a failure to mesh must not fail the write: an
 /// empty list means "no addressable solids", which is exactly what a 2D-only
 /// or empty document has.
-fn workspace_object_summaries(source: &str) -> Vec<Value> {
+fn workspace_object_summaries(source: impl Into<engine::Project>) -> Vec<Value> {
     compile_parts_guarded(source, engine::Quality::Preview)
         .map(|output| output.parts.iter().map(part_summary_public).collect())
         .unwrap_or_default()
@@ -4959,11 +5425,13 @@ fn mcp_list_workspace_objects(state: &AppState, arguments: &Value) -> Result<Val
         }
     }
     // Permit held by `mcp_call_tool`.
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_parts_guarded(workspace.project(), engine::Quality::Preview)?;
     Ok(json!({
         "ok": true,
         "workspaceId": id,
         "revision": workspace.revision,
+        "main": workspace.main,
+        "files": workspace_file_summaries(&workspace),
         "objects": compiled
             .parts
             .iter()
@@ -4978,13 +5446,16 @@ fn mcp_workspace_link(
     arguments: &Value,
 ) -> Result<Value, String> {
     let id = argument_workspace_id(arguments)?;
-    state
+    let workspace = state
         .workspaces
         .get(id)?
         .ok_or_else(|| "Workspace not found.".to_string())?;
     Ok(json!({
         "ok": true,
         "workspaceId": id,
+        "revision": workspace.revision,
+        "main": workspace.main,
+        "files": workspace_file_summaries(&workspace),
         "url": workspace_url(state, request, id),
         "appUri": format!("{WORKSPACE_APP_URI_PREFIX}{id}")
     }))
@@ -5001,7 +5472,7 @@ fn mcp_intersections(state: &AppState, arguments: &Value) -> Result<Value, Strin
         .and_then(Value::as_f64)
         .ok_or_else(|| "tolerance is required and must be a number.".to_string())?;
     // Permit held by `mcp_call_tool`.
-    let compiled = compile_parts_guarded(&workspace.code, engine::Quality::Preview)?;
+    let compiled = compile_parts_guarded(workspace.project(), engine::Quality::Preview)?;
     if multipart_binary_size(&compiled).is_none_or(|size| size > MAX_OUTPUT) {
         return Err("Aggregate multipart mesh output exceeds the 64 MiB limit.".into());
     }
@@ -5037,6 +5508,12 @@ fn supported_scad_dictionary() -> Value {
             "rands", "len", "concat", "str", "chr", "ord", "lookup", "search", "is_undef",
             "is_bool", "is_num", "is_string", "is_list", "is_function", "version", "version_num"
         ],
+        "files": {
+            "include": "include <name.scad> splices that file in place, variables and geometry included.",
+            "use": "use <name.scad> imports its modules and functions only. They keep seeing that file's own top-level variables; the caller does not, and use is not transitive.",
+            "resolution": "Names match workspace files exactly, then the bundled libraries. A workspace file shadows a bundled one of the same name.",
+            "bundledLibraries": ["units.scad", "shapes.scad", "MCAD/units.scad", "MCAD/shapes.scad"]
+        },
         "exportFormats": EXPORT_FORMATS,
         "notes": [
             "The dictionary describes implemented behavior, not full OpenSCAD parity.",
@@ -5064,9 +5541,9 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(input) => input,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let source = match input.get("code").and_then(Value::as_str) {
-        Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => return respond_error(stream, 400, "The editor is empty."),
+    let project = match render_overlay_project(state, &input) {
+        Ok(project) => project,
+        Err((status, error)) => return respond_error(stream, status, &error),
     };
     let mode = input
         .get("mode")
@@ -5101,7 +5578,7 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
     };
     // Started here, not at arrival: the watchdog measures compute, never wait.
     let deadline = RenderDeadline::start(&cancellation, deadline_for(quality));
-    let compiled = match compile_native(&source, quality, Some(&cancellation)) {
+    let compiled = match compile_native(project, quality, Some(&cancellation)) {
         Ok(compiled) => compiled,
         Err(error) if deadline.expired() => {
             return respond_error(stream, 422, &deadline.explain(error))
@@ -5126,8 +5603,64 @@ fn handle_render(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
     )
 }
 
+/// What the stateless `/api/render` and `/api/export` compile.
+///
+/// Plain `code` is a one-file project. With a `workspaceId` — or, for a
+/// read-only view, a `shareToken` — it is that workspace's stored files with
+/// `code` laid over `path` (the main file when absent), so text that is
+/// unsaved, or that failed validation and could not be saved, still compiles
+/// with every file it includes. The main file is what renders either way.
+/// Nothing here writes, so a share token grants no more than reading.
+fn render_overlay_project(
+    state: &AppState,
+    input: &Value,
+) -> Result<engine::Project, (u16, String)> {
+    let code = input.get("code").and_then(Value::as_str).unwrap_or_default();
+    let single = || {
+        if code.trim().is_empty() {
+            return Err((400, "The editor is empty.".to_string()));
+        }
+        Ok(engine::Project::single(code))
+    };
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let workspace = if let Some(token) = text("shareToken") {
+        state
+            .workspaces
+            .resolve_share(token)
+            .map_err(|error| (500, error))?
+            .ok_or_else(|| (404, "This read-only link is not valid.".to_string()))?
+    } else if let Some(id) = text("workspaceId") {
+        // A workspace the browser made while the server was unreachable has an
+        // id the server never saw; it renders as the one file it is.
+        match state.workspaces.get(id).map_err(|error| (500, error))? {
+            Some(workspace) => workspace,
+            None => return single(),
+        }
+    } else {
+        return single();
+    };
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(&workspace.main);
+    if !workspace.files.contains_key(path) && !valid_file_name(path) {
+        return Err((400, format!("{path:?} is not a valid file name.")));
+    }
+    let mut project = workspace.project();
+    project.files.insert(path.to_string(), code.to_string());
+    if total_source_bytes(&project.files) > MAX_BODY {
+        return Err((400, "Workspace code exceeds the 2 MiB limit.".into()));
+    }
+    Ok(project)
+}
+
 fn compile_native(
-    source: &str,
+    source: impl Into<engine::Project>,
     quality: engine::Quality,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CompiledMesh, String> {
@@ -5215,9 +5748,9 @@ fn handle_export(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(input) => input,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let source = match input.get("code").and_then(Value::as_str) {
-        Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => return respond_error(stream, 400, "The editor is empty."),
+    let project = match render_overlay_project(state, &input) {
+        Ok(project) => project,
+        Err((status, error)) => return respond_error(stream, status, &error),
     };
     let format = input
         .get("format")
@@ -5231,7 +5764,7 @@ fn handle_export(stream: &mut TcpStream, state: &AppState, body: &[u8]) -> io::R
         Ok(object_ids) => object_ids,
         Err(error) => return respond_error(stream, 400, &error),
     };
-    let mesh = match export_mesh(&source, object_ids.as_deref()) {
+    let mesh = match export_mesh(project, object_ids.as_deref()) {
         Ok(mesh) => mesh,
         Err(error) => return respond_error(stream, 422, &error),
     };
@@ -5530,8 +6063,9 @@ mod tests {
             "updatedAt": 1756000000001,
             "events": []
         }"#;
-        let workspace: Workspace = serde_json::from_str(legacy).unwrap();
-        assert_eq!(workspace.code, "cube(10);");
+        let mut workspace: Workspace = serde_json::from_str(legacy).unwrap();
+        workspace.adopt_legacy_code();
+        assert_eq!(workspace.main_code(), "cube(10);");
         assert_eq!(workspace.revision, 3);
         assert_eq!(workspace.plate, "");
         assert_eq!(workspace.tolerance, DEFAULT_TOLERANCE);
@@ -5557,7 +6091,7 @@ mod tests {
         let (store, root) = temporary_store();
         let created = store
             .create_with_settings(
-                "cube(1);".into(),
+                "cube(1);",
                 None,
                 Some("prusa-mk4s".into()),
                 Some(0.35),
@@ -5578,6 +6112,9 @@ mod tests {
             .update(
                 &created.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: Some("cube(2);".into()),
                     name: None,
                     start: None,
@@ -5611,7 +6148,9 @@ mod tests {
         let workspace = Workspace {
             id: "sunny-otter-0011223344556677".into(),
             name: "Untitled model".into(),
-            code: "cube(10);".into(),
+            main: default_main_file(),
+            files: single_file("cube(10);".into()),
+            legacy_code: String::new(),
             revision: 7,
             created_at: 1,
             updated_at: 2,
@@ -6063,7 +6602,7 @@ mod tests {
 
         let reopened = WorkspaceStore::open(root.clone()).unwrap();
         let loaded = reopened.get(&first.id).unwrap().unwrap();
-        assert_eq!(loaded.code, "cube(1);");
+        assert_eq!(loaded.main_code(), "cube(1);");
         assert_eq!(loaded.name, "Fixture");
         #[cfg(unix)]
         {
@@ -6091,6 +6630,9 @@ mod tests {
             .update(
                 &workspace.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: None,
                     name: None,
                     start: Some(5),
@@ -6104,7 +6646,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(updated.workspace.code, "cube(12);");
+        assert_eq!(updated.workspace.main_code(), "cube(12);");
         assert_eq!(updated.workspace.revision, 2);
         assert_eq!(updated.event.source, "ai");
         assert_eq!(updated.event.workspace_id, workspace.id);
@@ -6112,6 +6654,9 @@ mod tests {
             store.update(
                 &workspace.id,
                 WorkspaceUpdate {
+                    path: None,
+                    op: FileOp::Edit,
+                    to: None,
                     code: Some("sphere(3);".into()),
                     name: None,
                     start: None,
@@ -6126,8 +6671,654 @@ mod tests {
             ),
             Err(UpdateError::Conflict(_))
         ));
-        assert_eq!(store.get(&workspace.id).unwrap().unwrap().code, "cube(12);");
+        assert_eq!(store.get(&workspace.id).unwrap().unwrap().main_code(), "cube(12);");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Edits a workspace document on disk the way an older build, or a
+    /// feature that does not exist yet, would have written it.
+    fn rewrite_document(root: &Path, id: &str, edit: impl FnOnce(&mut Value)) {
+        let path = root.join(format!("{id}.json"));
+        let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut document);
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    }
+
+    fn replace_code(code: &str, revision: u64) -> WorkspaceUpdate {
+        WorkspaceUpdate {
+            path: None,
+            op: FileOp::Edit,
+            to: None,
+            code: Some(code.into()),
+            name: None,
+            start: None,
+            end: None,
+            text: None,
+            expected_revision: Some(revision),
+            base_revision: None,
+            plate: None,
+            tolerance: None,
+            source: "browser".into(),
+        }
+    }
+
+    #[test]
+    fn a_document_from_before_files_loads_and_keeps_a_code_copy() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(1);".into(), None).unwrap();
+        drop(store);
+        rewrite_document(&root, &workspace.id, |document| {
+            let object = document.as_object_mut().unwrap();
+            object.remove("main");
+            object.remove("files");
+            object.insert("code".into(), json!("cube(4);"));
+        });
+        let store = WorkspaceStore::open(root.clone()).unwrap();
+        let loaded = store.get(&workspace.id).unwrap().unwrap();
+        assert_eq!(loaded.main, "main.scad");
+        assert_eq!(loaded.files, single_file("cube(4);".into()));
+        store
+            .update(&workspace.id, replace_code("cube(5);", loaded.revision))
+            .unwrap();
+        // The new shape on disk, plus the copy an older build would read.
+        let path = root.join(format!("{}.json", workspace.id));
+        let written: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(written["main"], json!("main.scad"));
+        assert_eq!(written["files"], json!({"main.scad": "cube(5);"}));
+        assert_eq!(written["code"], json!("cube(5);"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_main_file_edit_is_validated_against_the_other_files() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(1);".into(), None).unwrap();
+        drop(store);
+        rewrite_document(&root, &workspace.id, |document| {
+            document["files"]["params.scad"] = json!("size = 3;");
+        });
+        let store = WorkspaceStore::open(root.clone()).unwrap();
+        let updated = store
+            .update(
+                &workspace.id,
+                replace_code("include <params.scad>\ncube(size);", 1),
+            )
+            .expect("the included file exists")
+            .workspace;
+        assert_eq!(updated.files["params.scad"], "size = 3;");
+        assert_eq!(workspace_object_summaries(updated.project()).len(), 1);
+        let missing = store.update(
+            &workspace.id,
+            replace_code("include <missing.scad>\ncube(1);", updated.revision),
+        );
+        assert!(
+            matches!(&missing, Err(UpdateError::Validation(message))
+                if message.contains("missing.scad")),
+            "{missing:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_size_limit_covers_every_file() {
+        let (store, root) = temporary_store();
+        let workspace = store.create("cube(1);".into(), None).unwrap();
+        drop(store);
+        rewrite_document(&root, &workspace.id, |document| {
+            document["files"]["big.scad"] = json!(format!("//{}", "x".repeat(MAX_BODY - 12)));
+        });
+        let store = WorkspaceStore::open(root.clone()).unwrap();
+        let result = store.update(&workspace.id, replace_code("cube([1, 2, 3]);", 1));
+        assert!(
+            matches!(&result, Err(UpdateError::Invalid(message)) if message.contains("2 MiB")),
+            "{result:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Applies a PATCH body exactly as a client would send it.
+    fn patch(
+        store: &WorkspaceStore,
+        id: &str,
+        revision: u64,
+        mut body: Value,
+    ) -> Result<EditResult, UpdateError> {
+        body["baseRevision"] = json!(revision);
+        store.update(id, serde_json::from_value(body).unwrap())
+    }
+
+    fn multi_file_workspace() -> (WorkspaceStore, PathBuf, Workspace) {
+        let (store, root) = temporary_store();
+        // Grown through the API, as a client would: the include can only
+        // validate once params.scad exists.
+        let created = store.create("cube(1);".into(), None).unwrap();
+        let workspace = patch(
+            &store,
+            &created.id,
+            created.revision,
+            json!({"path": "params.scad", "code": "size = 3;"}),
+        )
+        .unwrap()
+        .workspace;
+        let workspace = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"code": "include <params.scad>\ncube(size);"}),
+        )
+        .unwrap()
+        .workspace;
+        (store, root, workspace)
+    }
+
+    #[test]
+    fn editing_a_new_path_creates_the_file() {
+        let (_store, root, workspace) = multi_file_workspace();
+        assert_eq!(workspace.files.len(), 2);
+        assert_eq!(workspace.files["params.scad"], "size = 3;");
+        let created = &workspace.events[workspace.events.len() - 2];
+        assert_eq!(created.kind, EventKind::Create);
+        assert_eq!(created.path, "params.scad");
+        assert_eq!(workspace.events.last().unwrap().path, "main.scad");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_range_edit_reaches_a_non_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let result = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "params.scad", "start": 7, "end": 8, "text": "12"}),
+        )
+        .unwrap();
+        assert_eq!(result.workspace.files["params.scad"], "size = 12;");
+        assert_eq!(result.event.kind, EventKind::Edit);
+        assert_eq!(
+            (result.event.start, result.event.end, result.event.inserted_length),
+            (7, 8, 2)
+        );
+        let missing = patch(
+            &store,
+            &workspace.id,
+            result.workspace.revision,
+            json!({"path": "nope.scad", "start": 0, "end": 0, "text": "x"}),
+        );
+        assert!(
+            matches!(&missing, Err(UpdateError::Invalid(message)) if message.contains("Send `code`")),
+            "{missing:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_names_are_plain_scad_names() {
+        for name in [
+            "parts.scad",
+            "parts-v2.scad",
+            "lib.v1.scad",
+            "2_hinge.scad",
+            "MCAD.scad",
+        ] {
+            assert!(valid_file_name(name), "{name} should be accepted");
+        }
+        let long = format!("{}.scad", "a".repeat(MAX_FILE_NAME));
+        for name in [
+            "",
+            ".scad",
+            "parts",
+            "parts.txt",
+            "../parts.scad",
+            "dir/parts.scad",
+            "dir\\parts.scad",
+            ".hidden.scad",
+            "-dash.scad",
+            "a..b.scad",
+            "space name.scad",
+            "ünï.scad",
+            long.as_str(),
+        ] {
+            assert!(!valid_file_name(name), "{name:?} should be rejected");
+        }
+        let (store, root, workspace) = multi_file_workspace();
+        let rejected = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "../escape.scad", "code": "x = 1;"}),
+        );
+        assert!(
+            matches!(&rejected, Err(UpdateError::Invalid(message)) if message.contains("not a valid file name")),
+            "{rejected:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_holds_a_bounded_number_of_files() {
+        let (store, root, mut workspace) = multi_file_workspace();
+        while workspace.files.len() < MAX_FILES {
+            let name = format!("f{}.scad", workspace.files.len());
+            workspace = patch(
+                &store,
+                &workspace.id,
+                workspace.revision,
+                json!({"path": name, "code": ""}),
+            )
+            .unwrap()
+            .workspace;
+        }
+        let over = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "one-too-many.scad", "code": ""}),
+        );
+        assert!(
+            matches!(&over, Err(UpdateError::Invalid(message)) if message.contains("at most")),
+            "{over:?}"
+        );
+        // Editing an existing file is still fine at the cap.
+        patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "f2.scad", "code": "y = 1;"}),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_file_is_validated_and_spares_the_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let breaks_include = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "delete", "path": "params.scad"}),
+        );
+        assert!(
+            matches!(&breaks_include, Err(UpdateError::Validation(message)) if message.contains("params.scad")),
+            "{breaks_include:?}"
+        );
+        let main = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "delete", "path": "main.scad"}),
+        );
+        assert!(matches!(main, Err(UpdateError::Invalid(_))), "{main:?}");
+        let unused = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "unused.scad", "code": "z = 1;"}),
+        )
+        .unwrap()
+        .workspace;
+        let deleted = patch(
+            &store,
+            &workspace.id,
+            unused.revision,
+            json!({"op": "delete", "path": "unused.scad"}),
+        )
+        .unwrap();
+        assert!(!deleted.workspace.files.contains_key("unused.scad"));
+        assert_eq!(deleted.event.kind, EventKind::Delete);
+        assert_eq!(deleted.event.path, "unused.scad");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renaming_moves_the_file_and_follows_the_main_file() {
+        let (store, root, workspace) = multi_file_workspace();
+        let breaks_include = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "params.scad", "to": "sizes.scad"}),
+        );
+        assert!(
+            matches!(breaks_include, Err(UpdateError::Validation(_))),
+            "{breaks_include:?}"
+        );
+        let taken = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "main.scad", "to": "params.scad"}),
+        );
+        assert!(
+            matches!(&taken, Err(UpdateError::Invalid(message)) if message.contains("already exists")),
+            "{taken:?}"
+        );
+        let renamed = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"op": "rename", "path": "main.scad", "to": "box.scad"}),
+        )
+        .unwrap();
+        assert_eq!(renamed.workspace.main, "box.scad");
+        assert_eq!(
+            renamed.workspace.main_code(),
+            "include <params.scad>\ncube(size);"
+        );
+        assert!(!renamed.workspace.files.contains_key("main.scad"));
+        assert_eq!(renamed.event.kind, EventKind::Rename);
+        assert_eq!(renamed.event.to.as_deref(), Some("box.scad"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_main_changes_which_file_renders() {
+        let (store, root, workspace) = multi_file_workspace();
+        let lib = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "other.scad", "code": "sphere(2);"}),
+        )
+        .unwrap()
+        .workspace;
+        let switched = patch(
+            &store,
+            &workspace.id,
+            lib.revision,
+            json!({"op": "setMain", "path": "other.scad"}),
+        )
+        .unwrap();
+        assert_eq!(switched.workspace.main, "other.scad");
+        assert_eq!(switched.workspace.main_code(), "sphere(2);");
+        assert_eq!(switched.event.kind, EventKind::SetMain);
+        let missing = patch(
+            &store,
+            &workspace.id,
+            switched.workspace.revision,
+            json!({"op": "setMain", "path": "nope.scad"}),
+        );
+        assert!(matches!(missing, Err(UpdateError::Invalid(_))), "{missing:?}");
+        let with_code = patch(
+            &store,
+            &workspace.id,
+            switched.workspace.revision,
+            json!({"op": "setMain", "path": "main.scad", "code": "cube(1);"}),
+        );
+        assert!(matches!(with_code, Err(UpdateError::Invalid(_))), "{with_code:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_edit_rebases_over_edits_to_other_files() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        // An agent edits params.scad while the browser still holds `base`.
+        let agent = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"path": "params.scad", "code": "size = 4;", "source": "ai"}),
+        )
+        .unwrap();
+        assert_eq!(agent.workspace.revision, base + 1);
+        let browser = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"code": "include <params.scad>\ncube(size * 2);"}),
+        )
+        .expect("main.scad was untouched since base");
+        assert_eq!(browser.workspace.revision, base + 2);
+        assert_eq!(browser.event.revision, base + 2);
+        assert_eq!(browser.workspace.files["params.scad"], "size = 4;");
+        // A range edit against base + 1 already saw the agent's params.scad, and
+        // only main.scad changed after it, so it lands on the text it was made for.
+        let ranged = patch(
+            &store,
+            &workspace.id,
+            base + 1,
+            json!({"path": "params.scad", "start": 7, "end": 8, "text": "5"}),
+        )
+        .expect("only main.scad changed since base + 1");
+        assert_eq!(ranged.workspace.files["params.scad"], "size = 5;");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stale_edit_to_the_same_file_still_conflicts() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        patch(&store, &workspace.id, base, json!({"path": "params.scad", "code": "size = 4;"}))
+            .unwrap();
+        let stale = patch(
+            &store,
+            &workspace.id,
+            base,
+            json!({"path": "params.scad", "code": "size = 5;"}),
+        );
+        assert!(matches!(stale, Err(UpdateError::Conflict(_))), "{stale:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn structural_changes_never_rebase() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        let extra = patch(&store, &workspace.id, base, json!({"path": "extra.scad", "code": ""}))
+            .unwrap()
+            .workspace;
+        // A create of another file is rebased over...
+        patch(&store, &workspace.id, base, json!({"path": "params.scad", "code": "size = 4;"}))
+            .expect("a create elsewhere is not structural for params.scad");
+        let current = store.get(&workspace.id).unwrap().unwrap().revision;
+        // ...but a rename, delete or setMain since the base is not,
+        patch(
+            &store,
+            &workspace.id,
+            current,
+            json!({"op": "rename", "path": "extra.scad", "to": "more.scad"}),
+        )
+        .unwrap();
+        let after_rename = patch(
+            &store,
+            &workspace.id,
+            current,
+            json!({"path": "params.scad", "code": "size = 6;"}),
+        );
+        assert!(matches!(after_rename, Err(UpdateError::Conflict(_))), "{after_rename:?}");
+        // and a structural op itself always needs the current revision.
+        let stale_delete = patch(
+            &store,
+            &workspace.id,
+            extra.revision,
+            json!({"op": "delete", "path": "more.scad"}),
+        );
+        assert!(matches!(stale_delete, Err(UpdateError::Conflict(_))), "{stale_delete:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_base_older_than_the_event_log_conflicts() {
+        let (store, root, workspace) = multi_file_workspace();
+        let base = workspace.revision;
+        let mut revision = base;
+        for index in 0..=MAX_EVENTS {
+            revision = patch(
+                &store,
+                &workspace.id,
+                revision,
+                json!({"path": "params.scad", "code": format!("size = {index};")}),
+            )
+            .unwrap()
+            .workspace
+            .revision;
+        }
+        let stale = patch(&store, &workspace.id, base, json!({"code": "cube(1);"}));
+        assert!(matches!(stale, Err(UpdateError::Conflict(_))), "{stale:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stateless_renders_overlay_unsaved_text_on_the_workspace() {
+        let (state, root) = temporary_state(None);
+        let workspace = state
+            .workspaces
+            .create_with_settings(
+                engine::Project {
+                    main: "main.scad".into(),
+                    files: BTreeMap::from([
+                        ("main.scad".into(), "include <params.scad>\ncube(size);".into()),
+                        ("params.scad".into(), "size = 3;".into()),
+                    ]),
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let bounds = |project: engine::Project| {
+            let output = engine::compile(project, engine::Quality::Preview, None).unwrap();
+            output
+                .mesh
+                .triangles
+                .iter()
+                .flat_map(|triangle| triangle.vertices)
+                .map(|vertex| vertex.x)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        // Unsaved main-file text, with the stored params.scad.
+        let main = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "code": "include <params.scad>\ncube(size + 1);"}),
+        )
+        .unwrap();
+        assert!((bounds(main) - 4.0).abs() < 1e-6);
+        // Unsaved text of another file, rendered through the main file.
+        let other = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "path": "params.scad", "code": "size = 7;"}),
+        )
+        .unwrap();
+        assert!((bounds(other) - 7.0).abs() < 1e-6);
+        // A file that is not saved yet at all.
+        let new_file = render_overlay_project(
+            &state,
+            &json!({"workspaceId": workspace.id, "path": "new.scad", "code": ""}),
+        )
+        .unwrap();
+        assert!(new_file.files.contains_key("new.scad"));
+        let refused = |input: Value| render_overlay_project(&state, &input).unwrap_err().0;
+        assert_eq!(refused(json!({"workspaceId": workspace.id, "path": "../x.scad", "code": ""})), 400);
+        assert_eq!(
+            render_overlay_project(&state, &json!({"workspaceId": "no-such-workspace-0000", "code": "cube(1);"}))
+                .unwrap(),
+            engine::Project::single("cube(1);")
+        );
+        assert_eq!(refused(json!({"code": "  "})), 400);
+        assert_eq!(
+            render_overlay_project(&state, &json!({"code": "cube(1);"})).unwrap(),
+            engine::Project::single("cube(1);")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn share_tokens_render_every_file_and_nothing_more() {
+        let (state, root) = temporary_state(None);
+        let workspace = state
+            .workspaces
+            .create_with_settings(
+                engine::Project {
+                    main: "box.scad".into(),
+                    files: BTreeMap::from([
+                        ("box.scad".into(), "include <params.scad>\ncube(size);".into()),
+                        ("params.scad".into(), "size = 3;".into()),
+                    ]),
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let token = state.workspaces.share_token(&workspace.id).unwrap();
+        let project = render_overlay_project(
+            &state,
+            &json!({"shareToken": token, "code": "include <params.scad>\ncube(size);"}),
+        )
+        .unwrap();
+        assert_eq!(project.main, "box.scad");
+        assert_eq!(project.files["params.scad"], "size = 3;");
+        let bad = render_overlay_project(
+            &state,
+            &json!({"shareToken": "0".repeat(32), "code": "cube(1);"}),
+        );
+        assert_eq!(bad.unwrap_err().0, 404);
+        // Rendering with the token wrote nothing.
+        assert_eq!(
+            state.workspaces.get(&workspace.id).unwrap().unwrap().revision,
+            workspace.revision
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_file_is_rejected_even_when_nothing_includes_it() {
+        let (store, root, workspace) = multi_file_workspace();
+        let broken = patch(
+            &store,
+            &workspace.id,
+            workspace.revision,
+            json!({"path": "draft.scad", "code": "y = \"open;"}),
+        );
+        assert!(
+            matches!(&broken, Err(UpdateError::Validation(message)) if message.starts_with("draft.scad: ")),
+            "{broken:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payloads_list_files_and_the_reader_takes_a_path() {
+        let (store, root, workspace) = multi_file_workspace();
+        let events = workspace_events_payload(&workspace.id, &workspace, 0);
+        assert_eq!(events["main"], json!("main.scad"));
+        assert_eq!(
+            events["files"],
+            json!([
+                {"name": "main.scad", "bytes": workspace.main_code().len()},
+                {"name": "params.scad", "bytes": 9}
+            ])
+        );
+        let ranges = events["updatedRanges"].as_array().unwrap();
+        assert!(ranges.iter().any(|event| event["kind"] == "create"
+            && event["path"] == "params.scad"));
+        let slice = workspace_code_slice(&workspace, Some("params.scad"), Some(0), Some(4)).unwrap();
+        assert_eq!(slice["code"], json!("size"));
+        assert_eq!(slice["totalLength"], json!(9));
+        let main = workspace_code_slice(&workspace, None, None, None).unwrap();
+        assert_eq!(main["path"], json!("main.scad"));
+        assert!(workspace_code_slice(&workspace, Some("nope.scad"), None, None).is_err());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn events_logged_before_files_read_as_main_file_edits() {
+        let event: WorkspaceEvent = serde_json::from_value(json!({
+            "workspaceId": "x",
+            "revision": 2,
+            "source": "ai",
+            "start": 0,
+            "end": 1,
+            "insertedLength": 3,
+            "timestamp": 0
+        }))
+        .unwrap();
+        assert_eq!(event.kind, EventKind::Edit);
+        assert_eq!(event.path, "");
+        assert!(serde_json::to_value(&event).unwrap().get("to").is_none());
     }
 
     #[test]
@@ -6137,6 +7328,9 @@ mod tests {
         let result = store.update(
             &workspace.id,
             WorkspaceUpdate {
+                path: None,
+                op: FileOp::Edit,
+                to: None,
                 code: Some("cube(2);".into()),
                 name: None,
                 start: None,
@@ -6163,6 +7357,9 @@ mod tests {
         let result = store.update(
             &workspace.id,
             WorkspaceUpdate {
+                path: None,
+                op: FileOp::Edit,
+                to: None,
                 code: Some("cube(;".into()),
                 name: None,
                 start: None,
@@ -6183,7 +7380,7 @@ mod tests {
             .get(&workspace.id)
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.code, "cube(1);");
+        assert_eq!(loaded.main_code(), "cube(1);");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6526,6 +7723,149 @@ mod tests {
             body: vec![],
         };
         assert!(allow_missing_workspace(&request));
+    }
+
+    fn mcp_test_request() -> Request {
+        Request {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn create_workspace_uploads_a_multi_file_project() {
+        let (state, root) = temporary_state(None);
+        let request = mcp_test_request();
+        let result = mcp_call_tool(
+            &state,
+            &request,
+            "create_workspace",
+            json!({"files": {
+                "main.scad": "include <params.scad>\nuse <parts.scad>\npeg();",
+                "params.scad": "height = 12;",
+                "parts.scad": "include <params.scad>\nmodule peg() cylinder(h=height, r=2);"
+            }}),
+        );
+        assert_eq!(result["isError"], json!(false), "{result}");
+        let workspace = &result["structuredContent"]["workspace"];
+        assert_eq!(workspace["main"], json!("main.scad"));
+        assert_eq!(workspace["files"].as_array().unwrap().len(), 3);
+        let objects = workspace["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1, "{objects:?}");
+        assert_eq!(objects[0]["bounds"]["max"][2], json!(12.0));
+
+        let id = workspace["id"].as_str().unwrap();
+        let listed = mcp_call_tool(
+            &state,
+            &request,
+            "list_workspace_objects",
+            json!({"workspaceId": id}),
+        );
+        assert_eq!(listed["structuredContent"]["main"], json!("main.scad"));
+        assert_eq!(
+            listed["structuredContent"]["files"][1],
+            json!({"name": "params.scad", "bytes": 12})
+        );
+        let link = mcp_call_tool(&state, &request, "get_workspace_link", json!({"workspaceId": id}));
+        assert_eq!(link["structuredContent"]["files"].as_array().unwrap().len(), 3);
+        let read = mcp_call_tool(
+            &state,
+            &request,
+            "get_workspace_code",
+            json!({"workspaceId": id, "path": "params.scad"}),
+        );
+        assert_eq!(read["structuredContent"]["code"], json!("height = 12;"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_workspace_checks_files_like_an_edit_does() {
+        let rejected = |input: Value| match initial_project(&input) {
+            Err(UpdateError::Invalid(message) | UpdateError::Validation(message)) => message,
+            other => panic!("{input} should be refused, got {other:?}"),
+        };
+        assert!(rejected(json!({"files": {"../x.scad": "cube(1);"}})).contains("valid file name"));
+        assert!(rejected(json!({"files": {}})).contains("at least one"));
+        assert!(rejected(json!({"files": {"a.scad": 1}})).contains("must be a string"));
+        assert!(rejected(json!({"code": "cube(1);", "files": {"a.scad": "cube(1);"}}))
+            .contains("not both"));
+        assert!(rejected(json!({"files": {"a.scad": "cube(1);", "b.scad": "cube(2);"}}))
+            .contains("`main`"));
+        assert!(rejected(json!({"files": {"a.scad": "cube(1);"}, "main": "b.scad"}))
+            .contains("b.scad"));
+        assert!(rejected(json!({"files": {"main.scad": "include <gone.scad>\ncube(1);"}}))
+            .contains("gone.scad"));
+        // A file nothing includes is still checked, as it would be on an edit.
+        assert!(rejected(json!({"files": {
+            "main.scad": "cube(1);",
+            "draft.scad": "y = \"open;"
+        }}))
+        .starts_with("draft.scad: "));
+        let too_many = (0..=MAX_FILES)
+            .map(|index| (format!("f{index}.scad"), json!("")))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(rejected(json!({"files": too_many, "main": "f0.scad"})).contains("at most"));
+
+        // The main file is inferred when it is unambiguous.
+        let one = initial_project(&json!({"files": {"box.scad": "cube(1);"}})).unwrap();
+        assert_eq!(one.main, "box.scad");
+        let named = initial_project(&json!({"files": {
+            "a.scad": "cube(1);",
+            "main.scad": "cube(2);"
+        }}))
+        .unwrap();
+        assert_eq!(named.main, "main.scad");
+        let chosen = initial_project(&json!({
+            "files": {"a.scad": "cube(1);", "b.scad": "cube(2);"},
+            "main": "b.scad"
+        }))
+        .unwrap();
+        assert_eq!(chosen.main, "b.scad");
+        // And plain `code` still makes a one-file workspace.
+        assert_eq!(
+            initial_project(&json!({"code": "cube(3);"})).unwrap(),
+            engine::Project::single("cube(3);")
+        );
+    }
+
+    #[test]
+    fn agent_facing_text_describes_multi_file_workspaces() {
+        for text in [MCP_INSTRUCTIONS.to_string(), supported_scad_dictionary().to_string()]
+            .into_iter()
+            .chain(mcp_tool_definitions().iter().map(Value::to_string))
+        {
+            for stale in ["single-file", "single file", "no user file system", "bundled library only"] {
+                assert!(!text.contains(stale), "{stale:?} survives in {text}");
+            }
+        }
+        assert!(MCP_INSTRUCTIONS.contains("include <name.scad>"));
+        // The limit is spelled out in plain strings; keep them honest.
+        assert!(MCP_INSTRUCTIONS.contains(&format!("up to {MAX_FILES} .scad files")));
+        let update = mcp_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "update_workspace_code")
+            .unwrap();
+        for property in ["path", "op", "to"] {
+            assert!(update["inputSchema"]["properties"].get(property).is_some());
+        }
+        assert!(update["description"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("at most {MAX_FILES} files")));
+        let create = mcp_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "create_workspace")
+            .unwrap();
+        for property in ["files", "main"] {
+            assert!(create["inputSchema"]["properties"].get(property).is_some());
+        }
+        assert!(supported_scad_dictionary()["files"]["use"]
+            .as_str()
+            .unwrap()
+            .contains("not transitive"));
     }
 
     #[test]
@@ -6936,7 +8276,9 @@ mod tests {
         let workspace = Workspace {
             id: "sunny-otter-0011223344556677".into(),
             name: "Untitled model".into(),
-            code: "cube(10);".repeat(4096),
+            main: default_main_file(),
+            files: single_file("cube(10);".repeat(4096)),
+            legacy_code: String::new(),
             revision: 7,
             created_at: 1,
             updated_at: 2,
@@ -6955,7 +8297,7 @@ mod tests {
         assert_eq!(idle["revision"], json!(7));
         let changed = workspace_events_payload(&workspace.id, &workspace, 6);
         assert_eq!(changed["changed"], json!(true));
-        assert_eq!(changed["code"], json!(workspace.code));
+        assert_eq!(changed["code"], json!(workspace.main_code()));
     }
 
     /// The whole security property of a read-only link, stated as a test: it
@@ -6974,14 +8316,14 @@ mod tests {
         );
 
         let shared = store.resolve_share(&token).unwrap().expect("resolves");
-        assert_eq!(shared.code, "cube(7);");
+        assert_eq!(shared.main_code(), "cube(7);");
 
         // The payload the browser is handed, built exactly as the handler
         // builds it: source and settings, and no `id` anywhere in it.
         let payload = json!({
             "ok": true,
             "readOnly": true,
-            "code": shared.code,
+            "code": shared.main_code(),
             "revision": shared.revision,
             "plate": shared.plate,
             "tolerance": shared.tolerance,
@@ -7109,7 +8451,7 @@ mod tests {
         }
         // Evicted from RAM but still readable from disk.
         let reloaded = store.get(&ids[0]).unwrap().expect("workspace on disk");
-        assert_eq!(reloaded.code, "cube(1);");
+        assert_eq!(reloaded.main_code(), "cube(1);");
         assert_eq!(reloaded.revision, 1);
         let _ = fs::remove_dir_all(root);
     }
@@ -7125,7 +8467,7 @@ mod tests {
             assert!(inner.cache.is_empty(), "boot must not load sources into RAM");
         }
         let loaded = reopened.get(&created.id).unwrap().expect("persisted");
-        assert_eq!(loaded.code, "cube(3);");
+        assert_eq!(loaded.main_code(), "cube(3);");
         let _ = fs::remove_dir_all(root);
     }
 
